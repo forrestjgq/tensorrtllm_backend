@@ -64,6 +64,13 @@ class TritonPythonModel:
         elif tokenizer_type == 'auto':
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
                                                            padding_side='left')
+        elif tokenizer_type == 'chatglm':
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                           trust_remote_code=True)
+        elif tokenizer_type == 'baichuan':
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                           use_fast=False,
+                                                           trust_remote_code=True)
         elif tokenizer_type == 'llama':
             self.tokenizer = LlamaTokenizer.from_pretrained(
                 tokenizer_dir, legacy=False, padding_side='left')

@@ -53,6 +53,8 @@ class TritonPythonModel:
           * model_name: Model name
         """
         # Parse model configs
+        print(f"model_config: {args['model_config']}")
+        print(f"model_name: {args['model_name']}")
         model_config = json.loads(args['model_config'])
         tokenizer_dir = model_config['parameters']['tokenizer_dir'][
             'string_value']
@@ -62,6 +64,13 @@ class TritonPythonModel:
         if tokenizer_type == 't5':
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
                                          padding_side='left')
+        elif tokenizer_type == 'chatglm':
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                           trust_remote_code=True)
+        elif tokenizer_type == 'baichuan':
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                           use_fast=False,
+                                                           trust_remote_code=True)
         elif tokenizer_type == 'auto':
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
                                                            padding_side='left')
