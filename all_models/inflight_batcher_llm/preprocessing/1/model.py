@@ -53,8 +53,6 @@ class TritonPythonModel:
           * model_name: Model name
         """
         # Parse model configs
-        print(f"model_config: {args['model_config']}")
-        print(f"model_name: {args['model_name']}")
         model_config = json.loads(args['model_config'])
         tokenizer_dir = model_config['parameters']['tokenizer_dir'][
             'string_value']
@@ -80,10 +78,13 @@ class TritonPythonModel:
         else:
             raise AttributeError(
                 f'Unexpected tokenizer type: {tokenizer_type}')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.pad_id = self.tokenizer.encode(self.tokenizer.pad_token,
-                                            add_special_tokens=False)[0]
+        if tokenizer_type == 'chatglm':
+            self.pad_id = self.tokenizer.pad_token_id
+            self.end_id = self.tokenizer.eos_token_id
+        else:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.pad_id = self.tokenizer.encode(self.tokenizer.pad_token,
+                                                add_special_tokens=False)[0]
 
         # Parse model output configs and convert Triton types to numpy types
         output_names = [

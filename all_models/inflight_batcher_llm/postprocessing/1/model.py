@@ -77,7 +77,11 @@ class TritonPythonModel:
         else:
             raise AttributeError(
                 f'Unexpected tokenizer type: {tokenizer_type}')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if tokenizer_type != 'chatglm':
+            self.decode_args = {'skip_special_tokens': True}
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        else:
+            self.decode_args = {'skip_special_tokens': True}
 
         # Parse model output configs
         output_config = pb_utils.get_output_config_by_name(
@@ -160,6 +164,6 @@ class TritonPythonModel:
         for batch_idx, beam_tokens in enumerate(tokens_batch):
             for beam_idx, tokens in enumerate(beam_tokens):
                 seq_len = sequence_lengths[batch_idx][beam_idx]
-                output = self.tokenizer.decode(tokens[:seq_len])
+                output = self.tokenizer.decode(tokens[:seq_len], **self.decode_args)
                 outputs.append(output.encode('utf8'))
         return outputs
