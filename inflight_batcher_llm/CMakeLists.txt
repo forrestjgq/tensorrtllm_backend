@@ -57,6 +57,12 @@ project(tritontensorrtllmbackend LANGUAGES C CXX)
 # related features since TRT-LLM backend manages the usage on GPUs itself.
 option(TRITON_ENABLE_GPU "Enable GPU support in backend" OFF)
 option(TRITON_ENABLE_STATS "Include statistics collections in backend" ON)
+option(TRITON_ENABLE_METRICS "Include metrics support in server" ON)
+
+if(TRITON_ENABLE_METRICS AND NOT TRITON_ENABLE_STATS)
+  message(
+    FATAL_ERROR "TRITON_ENABLE_METRICS=ON requires TRITON_ENABLE_STATS=ON")
+endif()
 
 # The TRTLLM_BUILD_CONTAINER is used to compile the TRT-LLM libraries that are
 # needed for the TRT-LLM backend. The TRTLLM_BUILD_CONTAINER is launched
@@ -141,7 +147,11 @@ endif()
 #
 configure_file(src/libtriton_tensorrtllm.ldscript
                libtriton_tensorrtllm.ldscript COPYONLY)
-add_library(triton-tensorrt-llm-backend SHARED src/libtensorrtllm.cc)
+
+set(SRCS src/libtensorrtllm.cc src/work_item.cc src/work_items_queue.cc
+         src/model_instance_state.cc src/model_state.cc src/utils.cc)
+
+add_library(triton-tensorrt-llm-backend SHARED ${SRCS})
 
 if(TRITON_BUILD)
   add_custom_target(trtllm_target DEPENDS tensorrt_llm_build)
@@ -245,6 +255,7 @@ target_compile_options(
     -Wall
     -Wextra
     -Wno-unused-parameter
+    -Wno-deprecated-declarations
     -Wno-type-limits>
     $<$<CXX_COMPILER_ID:MSVC>:/Wall
     /D_WIN32_WINNT=0x0A00
@@ -321,6 +332,45 @@ set_property(
     IMPORTED_LOCATION
     "${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so"
 )
+
+if(TRITON_ENABLE_METRICS)
+  message("Compiling statistics reporter...")
+  list(APPEND REPORTER_SRCS
+       src/custom_metrics_reporter/custom_metrics_reporter.cc)
+  list(APPEND REPORTER_HDRS
+       src/custom_metrics_reporter/custom_metrics_reporter.h)
+
+  add_library(triton-custom-metrics-reporter-library EXCLUDE_FROM_ALL
+              ${REPORTER_SRCS} ${REPORTER_HDRS})
+  target_compile_features(triton-custom-metrics-reporter-library
+                          PRIVATE cxx_std_17)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(triton-custom-metrics-reporter-library
+                           PRIVATE /W1 /D_WIN32_WINNT=0x0A00 /EHsc)
+  else()
+    target_compile_options(
+      triton-custom-metrics-reporter-library
+      PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
+              -Werror)
+  endif()
+
+  set_target_properties(triton-custom-metrics-reporter-library
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  target_link_libraries(
+    triton-custom-metrics-reporter-library
+    PUBLIC triton-common-json # from repo-common
+           triton-common-logging # from repo-common
+           triton-core-serverapi # from repo-core
+           triton-core-serverstub # from repo-core
+           triton-backend-utils # from repo-backend
+           tensorrt_llm_batch_manager)
+
+  target_compile_definitions(triton-tensorrt-llm-backend
+                             PRIVATE TRITON_ENABLE_METRICS=1)
+  target_link_libraries(triton-tensorrt-llm-backend
+                        PRIVATE triton-custom-metrics-reporter-library)
+endif()
 
 if(TRITON_BUILD)
   add_dependencies(tensorrt_llm trtllm_target)
