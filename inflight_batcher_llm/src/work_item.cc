@@ -53,6 +53,11 @@ WorkItem::~WorkItem()
     {
         TRITONBACKEND_ResponseFactoryDelete(factory_ptr_);
     }
+#if USE_DGTRT
+    for(auto id : mStorageIds) {
+        dg::pop_request_storage(id);
+    }
+#endif
 }
 
 TRITONBACKEND_ResponseFactory* WorkItem::response_factory()
@@ -85,6 +90,64 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
     std::map<std::string, NamedTensor> input_tensors;
     uint32_t num_inputs;
     LOG_IF_ERROR(TRITONBACKEND_RequestInputCount(request, &num_inputs), "Error getting input count");
+#ifdef USE_DGTRT
+    int featsize = 0;
+    for (uint32_t idx = 0; idx < num_inputs; ++idx)
+    {
+        TRITONBACKEND_Input* input = 0L;
+        TRITONBACKEND_RequestInputByIndex(request, idx, &input);
+
+        const char* input_name = 0L;
+        TRITONSERVER_DataType data_type = TRITONSERVER_TYPE_INVALID;
+        const int64_t* shape = 0L;
+        uint32_t dims_count = 0;
+        uint64_t byte_size = 0;
+        uint32_t buffer_count = 0;
+        TRITONBACKEND_InputProperties(input, &input_name, &data_type, &shape, &dims_count, &byte_size, &buffer_count);
+        // printf(">> backend pid %d\n", (int)getpid());
+        // printf("input name %s data type %d dims %u byte size %d buf cnt %u\n", input_name, int(data_type),
+        //     dims_count, int(byte_size), buffer_count);
+        if (std::string(input_name) == "image_features")
+        {
+            int hiddenBytes = 4096 * TRITONSERVER_DataTypeByteSize(data_type);
+            if (byte_size > hiddenBytes)
+            {
+                auto nimg = shape[1];
+                auto imgsz = byte_size / nimg;
+                featsize = (int) imgsz / hiddenBytes;
+                // printf("nimg %d imgsz %d featsz %d\n", int(nimg), int(imgsz), int(featsize));
+
+                std::shared_ptr<uint8_t> buf(new uint8_t[byte_size]);
+                uint64_t buffer_offset = 0;
+                for (int64_t buffer_id = 0; buffer_id < buffer_count; ++buffer_id)
+                {
+                    const void* buffer = 0L;
+                    uint64_t buffer_byte_size = 0;
+                    TRITONSERVER_MemoryType memory_type = TRITONSERVER_MEMORY_CPU;
+                    int64_t memory_type_id = 0;
+                    TRITONBACKEND_InputBuffer(
+                        input, buffer_id, &buffer, &buffer_byte_size, &memory_type, &memory_type_id);
+                    assert((memory_type == TRITONSERVER_MEMORY_CPU) || (memory_type == TRITONSERVER_MEMORY_CPU_PINNED));
+                    // printf("buf offset %d byte sz %d src %p dst %p\n", int(buffer_offset), int(buffer_byte_size),
+                    // buffer, buf.get()+buffer_offset);
+                    std::memcpy(buf.get() + buffer_offset, buffer, buffer_byte_size);
+                    buffer_offset += buffer_byte_size;
+                }
+                for (auto i = 0u; i < nimg; i++)
+                {
+                    // printf("copy image %d\n", int(i));
+                    std::shared_ptr<uint8_t> sp(new uint8_t[imgsz]);
+                    std::memcpy(sp.get(), buf.get() + i * imgsz, imgsz);
+                    auto id = dg::add_request_storage(sp);
+                    mStorageIds.push_back(id);
+                    // printf("push image id %d\n", id);
+                }
+            }
+            break;
+        }
+    }
+    // printf("store ids len %d\n", int(mStorageIds.size()));
+#endif
     for (uint32_t idx = 0; idx < num_inputs; ++idx)
     {
         TRITONBACKEND_Input* input = 0L;
@@ -100,7 +163,11 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
 
         if (std::string(input_name) == "START" || std::string(input_name) == "CORRID"
             || std::string(input_name) == "END" || std::string(input_name) == kStopInputTensorName
-            || std::string(input_name) == kStreamingInputTensorName)
+            || std::string(input_name) == kStreamingInputTensorName
+#ifdef USE_DGTRT
+            || std::string(input_name) == "image_features"
+#endif
+        )
         {
             continue;
         }
@@ -125,6 +192,24 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
             std::memcpy(static_cast<char*>(t.tensor->data()) + buffer_offset, buffer, buffer_byte_size);
             buffer_offset += buffer_byte_size;
         }
+#ifdef USE_DGTRT
+        // fix input ids with store id and blksize: [-200, blksz, store id]
+        if (!mStorageIds.empty() && std::string(input_name) == "input_ids")
+        {
+            auto p = static_cast<int*>(t.tensor->data());
+            auto sz = byte_size / sizeof(int);
+            int storeidx = 0;
+            for (auto i = 0; i < sz - 500; i++)
+            {
+                if (p[i] == -200)
+                {
+                    p[i + 1] = featsize;
+                    p[i + 2] = mStorageIds[storeidx++];
+                    i += featsize;
+                }
+            }
+        }
+#endif
 
         inferenceRequest->emplaceInputTensor(t.name, std::move(t.tensor));
     }

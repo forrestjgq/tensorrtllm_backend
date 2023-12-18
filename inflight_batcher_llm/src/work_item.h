@@ -96,6 +96,9 @@ private:
 
     Timestamps mTimestamps;
     TRITONBACKEND_Request* mTritonInferenceRequest;
+#ifdef USE_DGTRT
+    std::vector<int> mStorageIds;
+#endif
 };
 
 } // namespace triton::backend::inflight_batcher_llm
