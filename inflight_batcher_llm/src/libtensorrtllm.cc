@@ -53,9 +53,6 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include <nlohmann/json.hpp>
-#ifndef USE_DGTRT
-#define USE_DGTRT
-#endif
 
 #ifdef USE_DGTRT
 #include "storage.h"
