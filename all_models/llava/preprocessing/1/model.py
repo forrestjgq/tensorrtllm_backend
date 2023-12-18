@@ -27,6 +27,7 @@
 import json
 from typing import List
 
+import os
 import numpy as np
 import triton_python_backend_utils as pb_utils
 from clip_encoder import Tokenizer, CLIPVisionTower, create_request
@@ -92,8 +93,15 @@ class TritonPythonModel:
             
 
         self.llava = tokenizer_dir
-        mmw = self.llava + "/pytorch_model-00002-of-00002.bin"
-        self.vt = CLIPVisionTower(self.llava, mmw, torch.device("cuda:0"))
+        with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
+            js = json.load(fp)
+            wmap = js["weight_map"]
+            bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
+            assert len(bins) == 1
+            mmw = os.path.join(self.llava, bins.pop())
+            
+        sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
+        self.vt = CLIPVisionTower(self.llava, mmw, torch.device(sdevice))
         self.tk = Tokenizer(self.llava)
         self.tk.tokenizer.pad_token = self.tk.tokenizer.eos_token
         self.pad_id = self.tk.tokenizer.encode(
