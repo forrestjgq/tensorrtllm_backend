@@ -293,6 +293,27 @@ else()
   )
 endif()
 
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "-c"
+          "import dgtrt as dg; print(dg.get_cmake_linking(),end='');"
+  RESULT_VARIABLE DGTRT_SO_PATH_RET
+  OUTPUT_VARIABLE DGTRT_SO_PATH)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} "-c"
+          "import dgtrt as dg; print(dg.get_include_dir(),end='');"
+  RESULT_VARIABLE DGTRT_INCLUDE_PATH_RET
+  OUTPUT_VARIABLE DGTRT_INCLUDE_PATH)
+
+set(DG_LIBS)
+if((${DGTRT_SO_PATH_RET} MATCHES 0) AND (${DGTRT_INCLUDE_PATH_RET} MATCHES 0))
+  include_directories(${DGTRT_INCLUDE_PATH})
+  set(DG_LIBS "${DGTRT_SO_PATH}")
+  add_definitions(-DUSE_DGTRT)
+  message(STATUS "Found dgtrt ${DGTRT_INCLUDE_PATH} ${DGTRT_SO_PATH}")
+else()
+  message(ERROR "dgtrt not found.")
+endif()
 add_library(nvinfer_plugin_tensorrt_llm SHARED IMPORTED)
 set_property(
   TARGET nvinfer_plugin_tensorrt_llm
@@ -318,7 +339,8 @@ target_link_libraries(
           ${MPI_LIBRARIES}
           ${CUDA_LIBRARIES}
           nvinfer
-          nvinfer_plugin_tensorrt_llm)
+          nvinfer_plugin_tensorrt_llm
+          ${DG_LIBS})
 
 FetchContent_Declare(
   json

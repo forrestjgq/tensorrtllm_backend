@@ -54,6 +54,12 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef USE_DGTRT
+#include "storage.h"
+#include <unistd.h>
+#endif
+// #undef USE_DGTRT
+
 using namespace ::triton::common; // TritonJson
 
 //
@@ -486,6 +492,65 @@ private:
         std::map<std::string, NamedTensor> input_tensors;
         uint32_t num_inputs;
         LOG_IF_ERROR(TRITONBACKEND_RequestInputCount(request, &num_inputs), "Error getting input count");
+#ifdef USE_DGTRT
+        std::vector<int> store_ids;
+        int featsize = 0;
+        for (uint32_t idx = 0; idx < num_inputs; ++idx)
+        {
+            TRITONBACKEND_Input* input = 0L;
+            TRITONBACKEND_RequestInputByIndex(request, idx, &input);
+
+            const char* input_name = 0L;
+            TRITONSERVER_DataType data_type = TRITONSERVER_TYPE_INVALID;
+            const int64_t* shape = 0L;
+            uint32_t dims_count = 0;
+            uint64_t byte_size = 0;
+            uint32_t buffer_count = 0;
+            TRITONBACKEND_InputProperties(
+                input, &input_name, &data_type, &shape, &dims_count, &byte_size, &buffer_count);
+            // printf(">> backend pid %d\n", (int)getpid());
+            // printf("input name %s data type %d dims %u byte size %d buf cnt %u\n", input_name, int(data_type),
+            //     dims_count, int(byte_size), buffer_count);
+            if (std::string(input_name) == "image_features") {
+                int hiddenBytes = 4096 * TRITONSERVER_DataTypeByteSize(data_type);
+                if (byte_size > hiddenBytes) {
+                    auto nimg = shape[1];
+                    auto imgsz = byte_size / nimg;
+                    featsize = (int) imgsz / hiddenBytes;
+                    // printf("nimg %d imgsz %d featsz %d\n", int(nimg), int(imgsz), int(featsize));
+
+                    std::shared_ptr<uint8_t> buf(new uint8_t[byte_size]);
+                    uint64_t buffer_offset = 0;
+                    for (int64_t buffer_id = 0; buffer_id < buffer_count; ++buffer_id)
+                    {
+                        const void* buffer = 0L;
+                        uint64_t buffer_byte_size = 0;
+                        TRITONSERVER_MemoryType memory_type = TRITONSERVER_MEMORY_CPU;
+                        int64_t memory_type_id = 0;
+                        TRITONBACKEND_InputBuffer(
+                            input, buffer_id, &buffer, &buffer_byte_size, &memory_type, &memory_type_id);
+                        assert((memory_type == TRITONSERVER_MEMORY_CPU)
+                            || (memory_type == TRITONSERVER_MEMORY_CPU_PINNED));
+                        // printf("buf offset %d byte sz %d src %p dst %p\n", int(buffer_offset), int(buffer_byte_size),
+                        // buffer, buf.get()+buffer_offset);
+                        std::memcpy(buf.get() + buffer_offset, buffer, buffer_byte_size);
+                        buffer_offset += buffer_byte_size;
+                    }
+                    for (auto i = 0u; i < nimg; i++)
+                    {
+                        // printf("copy image %d\n", int(i));
+                        std::shared_ptr<uint8_t> sp(new uint8_t[imgsz]);
+                        std::memcpy(sp.get(), buf.get() + i * imgsz, imgsz);
+                        auto id = dg::add_request_storage(sp);
+                        store_ids.push_back(id);
+                        // printf("push image id %d\n", id);
+                    }
+                }
+                break;
+            }
+        }
+        // printf("store ids len %d\n", int(store_ids.size()));
+#endif
         for (uint32_t idx = 0; idx < num_inputs; ++idx)
         {
             TRITONBACKEND_Input* input = 0L;
@@ -502,7 +567,11 @@ private:
 
             if (std::string(input_name) == "START" || std::string(input_name) == "CORRID"
                 || std::string(input_name) == "END" || std::string(input_name) == kStopInputTensorName
-                || std::string(input_name) == kStreamingInputTensorName)
+                || std::string(input_name) == kStreamingInputTensorName
+#ifdef USE_DGTRT
+                || std::string(input_name) == "image_features" 
+#endif
+                )
             {
                 continue;
             }
@@ -511,6 +580,7 @@ private:
             for (uint32_t i = 0; i < dims_count; ++i)
             {
                 shapev.push_back(shape[i]);
+                // printf("Shape %u: %ld\n", i, shape[i]);
             }
 
             NamedTensor t(to_trt_datatype(data_type), shapev, input_name);
@@ -527,6 +597,21 @@ private:
                 std::memcpy(static_cast<char*>(t.tensor->data()) + buffer_offset, buffer, buffer_byte_size);
                 buffer_offset += buffer_byte_size;
             }
+
+#ifdef USE_DGTRT
+            if(!store_ids.empty() && std::string(input_name) == "input_ids") {
+                auto p = static_cast<int*>(t.tensor->data());
+                auto sz = byte_size / sizeof(int);
+                int storeidx = 0;
+                for (auto i = 0; i < sz-500; i++) {
+                    if (p[i] == -200) {
+                        p[i+1] = featsize;
+                        p[i+2] = store_ids[storeidx++];
+                        i += featsize;
+                    }
+                }
+            }
+#endif
 
             inferenceRequest->emplaceInputTensor(t.name, std::move(t.tensor));
         }
@@ -902,6 +987,8 @@ public:
         return;
     }
 
+    void process_storage(InferenceRequest *req) {
+    }
     // Return up to max_num_requests inference requests.
     std::list<std::shared_ptr<InferenceRequest>> get_inference_requests(const int max_num_requests)
     {
@@ -1029,6 +1116,25 @@ public:
                         const auto dtype_size = BufferDataType(it->tensor->getDataType()).getSize();
                         BufferManager::ITensorPtr t = BufferManager::cpu(new_shape, it->tensor->getDataType());
                         memset(t->data(), 0, t->getSizeInBytes());
+                        for (int32_t batch_idx = 0; batch_idx < old_shape.d[0]; ++batch_idx)
+                        {
+                            const auto old_batch_offset = batch_idx * old_shape.d[1] * old_shape.d[2];
+                            for (int32_t beam = 0; beam < old_shape.d[1]; ++beam)
+                            {
+                                auto ptr = (int *)it->tensor->data(old_batch_offset + beam * old_shape.d[2]);
+                                for (auto idx = 0; idx < input_lengths_data[batch_idx]; idx++) {
+                                    // printf("input[%d]: %d\n", idx, ptr[idx]);
+                                    if (ptr[idx] == -200) {
+                                        auto storeid = ptr[idx+2];
+                                        if (storeid > 0) {
+                                            // printf("pop %d\n", storeid);
+                                            dg::pop_request_storage(storeid);
+                                        }
+                                        idx += ptr[idx+1];
+                                    }
+                                }
+                            }
+                        }
                         for (int32_t batch_idx = 0; batch_idx < old_shape.d[0]; ++batch_idx)
                         {
                             TLLM_CHECK(input_lengths_data[batch_idx] + new_shape.d[2] <= old_shape.d[2]);
@@ -1407,7 +1513,9 @@ extern "C"
         ModelInstanceState* instance_state;
         RETURN_IF_ERROR(ModelInstanceState::Create(model_state, instance, &instance_state));
         RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceSetState(instance, reinterpret_cast<void*>(instance_state)));
-
+#ifdef USE_DGTRT
+        dg::enable_request_storage();
+#endif
         return nullptr; // success
     }
 
