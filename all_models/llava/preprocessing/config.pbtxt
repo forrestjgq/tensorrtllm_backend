@@ -110,7 +110,7 @@ output [
     {
         name: "IMAGE_FEATURE"
         data_type: TYPE_FP16
-        dims: [ -1, -1 ]
+        dims: [ -1, -1, -1 ]
     }
 
 ]

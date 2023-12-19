@@ -84,7 +84,8 @@ public:
 
 private:
     // Convert Trition request to trtllm InferenceRequest
-    static std::shared_ptr<InferenceRequest> createInferenceRequest(
+    // static // jgq remove static to enable mStorageIds
+    std::shared_ptr<InferenceRequest> createInferenceRequest(
         TRITONBACKEND_Request* request, uint64_t requestId, bool isDecoupled);
 
     void Initialize(TRITONBACKEND_Request* request, uint64_t requestId, bool isDecoupled);

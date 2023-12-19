@@ -48,6 +48,10 @@
 #include "custom_metrics_reporter/custom_metrics_reporter.h"
 #endif
 
+#ifdef USE_DGTRT
+#include "storage.h"
+#endif
+
 namespace triton::backend::inflight_batcher_llm
 {
 

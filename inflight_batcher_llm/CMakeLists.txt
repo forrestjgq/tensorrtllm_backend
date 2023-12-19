@@ -43,6 +43,7 @@ else()
   set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
 endif()
 
+message("TRTLLM DIR ${TRTLLM_DIR}")
 include(${TRTLLM_DIR}/cpp/cmake/modules/find_library_create_target.cmake)
 
 project(tritontensorrtllmbackend LANGUAGES C CXX)

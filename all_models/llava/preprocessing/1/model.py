@@ -210,7 +210,7 @@ class TritonPythonModel:
             embedding_bias_tensor = pb_utils.Tensor("EMBEDDING_BIAS", embedding_bias)
 
             if feats is not None:
-                feats = [feat.reshape((feat.shape[0], -1)) for feat in feats] # turn [(1,576, 4096)] -> [(1, 576x4096)]
+                # feats = [feat.reshape((feat.shape[0], -1)) for feat in feats] # turn [(1,576, 4096)] -> [(1, 576x4096)]
                 feats = np.ascontiguousarray(np.array(feats)).astype(self.image_feature_dtype)
             else:
                 feats = np.zeros((input_id.shape[0],1,1)).astype(self.image_feature_dtype)
