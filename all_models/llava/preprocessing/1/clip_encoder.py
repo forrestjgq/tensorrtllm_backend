@@ -645,7 +645,7 @@ class CLIPVisionTower(nn.Module):
         if image_file.startswith("http") or image_file.startswith("https"):
             response = requests.get(image_file)
             image = Image.open(BytesIO(response.content)).convert("RGB")
-        elif pathlib.Path(image_file).exists():
+        elif len(image_file) < 1024 and pathlib.Path(image_file).exists():
             image = Image.open(image_file).convert("RGB")
         else:
             # treat as base64
