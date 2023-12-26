@@ -30,7 +30,7 @@ from typing import List
 import os
 import numpy as np
 import triton_python_backend_utils as pb_utils
-from clip_encoder import Tokenizer, CLIPVisionTower, create_request
+from clip_encoder import Tokenizer, CLIPVisionTower, create_request_vega, create_request_vision_tower, create_request_noimg, create_request_feat
 import torch
 
 
@@ -56,7 +56,10 @@ class TritonPythonModel:
         """
         # Parse model configs
         model_config = json.loads(args["model_config"])
-        tokenizer_dir = model_config["parameters"]["tokenizer_dir"]["string_value"]
+        params = model_config["parameters"]
+        tokenizer_dir = params["tokenizer_dir"]["string_value"]
+        self.schema = params["schema"]["string_value"]
+        self.hidden_size = int(params["hidden_size"]["string_value"])
         # tokenizer_type = model_config['parameters']['tokenizer_type'][
         #     'string_value']
 
@@ -66,7 +69,8 @@ class TritonPythonModel:
             "REQUEST_INPUT_LEN",
             "BAD_WORDS_IDS",
             "STOP_WORDS_IDS",
-            "IMAGE_FEATURE"
+            "IMAGE_FEATURE",
+            "FEATURE_PATH"
         ]
         input_names = ["EMBEDDING_BIAS_WORDS", "EMBEDDING_BIAS_WEIGHTS"]
         for input_name in input_names:
@@ -93,15 +97,19 @@ class TritonPythonModel:
             
 
         self.llava = tokenizer_dir
-        with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
-            js = json.load(fp)
-            wmap = js["weight_map"]
-            bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
-            assert len(bins) == 1
-            mmw = os.path.join(self.llava, bins.pop())
             
-        sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
-        self.vt = CLIPVisionTower(self.llava, mmw, torch.device(sdevice))
+        if self.schema == "vision_tower":
+            with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
+                js = json.load(fp)
+                wmap = js["weight_map"]
+                bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
+                assert len(bins) == 1
+                mmw = os.path.join(self.llava, bins.pop())
+                sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
+                print(f"loading vision tower to device {sdevice}")
+                self.vt = CLIPVisionTower(self.llava, mmw, torch.device(sdevice))
+        elif self.schema == 'input_feature':
+            self.vt = None
         self.tk = Tokenizer(self.llava)
         self.tk.tokenizer.pad_token = self.tk.tokenizer.eos_token
         self.pad_id = self.tk.tokenizer.encode(
@@ -135,6 +143,8 @@ class TritonPythonModel:
         # and create a pb_utils.InferenceResponse for each of them.
         logger = pb_utils.Logger
         for idx, request in enumerate(requests):
+            # print(f'req dir {dir(request)}')
+            # print(f'req id {request.request_id()}')
             # Get input tensors
             query = pb_utils.get_input_tensor_by_name(request, "QUERY").as_numpy()
             batch_dim = query.shape[0]
@@ -157,6 +167,9 @@ class TritonPythonModel:
             images = pb_utils.get_input_tensor_by_name(request, "IMAGES")
             if images is not None:
                 images = images.as_numpy()
+            feat_size = pb_utils.get_input_tensor_by_name(request, "FEATURE_SIZE")
+            if feat_size is not None:
+                feat_size = feat_size.as_numpy()
 
             bad_words_dict = pb_utils.get_input_tensor_by_name(
                 request, "BAD_WORDS_DICT"
@@ -183,7 +196,24 @@ class TritonPythonModel:
                 embedding_bias_weights = embedding_bias_weights.as_numpy()
 
             # Preprocessing input data.
-            input_id, request_input_len, feats = create_request(self.tk, self.vt, query, images, self.pad_id)
+            feats = None
+            feat_path = None
+            if images is not None:
+                if self.schema == 'input_feature':
+                    # input feature requires feature size and feature file path, 
+                    # feature size is used to insert placeholders into input-ids
+                    # feature file will be loaded inside trtllm backend and saved
+                    # for lookup-plugin
+                    assert feat_size is not None
+                    input_id, request_input_len, feat_path = create_request_feat(self.tk, query, images, feat_size[0][0], self.pad_id, self.hidden_size)
+                elif self.schema == 'vision_tower':
+                    assert self.vt is not None
+                    input_id, request_input_len, feats = create_request_vision_tower(self.tk, self.vt, query, images, self.pad_id)
+                    feats = np.array(feats, dtype=self.image_feature_dtype)
+                else:
+                    raise Exception(f'unknown schema {self.schema}') 
+            else:
+                input_id, request_input_len = create_request_noimg(self.tk, query, self.pad_id)
             bad_words = self._to_word_list_format(bad_words_dict)
             stop_words = self._to_word_list_format(stop_words_dict)
 
@@ -209,12 +239,12 @@ class TritonPythonModel:
             stop_words_ids_tensor = pb_utils.Tensor("STOP_WORDS_IDS", stop_words)
             embedding_bias_tensor = pb_utils.Tensor("EMBEDDING_BIAS", embedding_bias)
 
-            if feats is not None:
-                # feats = [feat.reshape((feat.shape[0], -1)) for feat in feats] # turn [(1,576, 4096)] -> [(1, 576x4096)]
-                feats = np.ascontiguousarray(np.array(feats)).astype(self.image_feature_dtype)
-            else:
-                feats = np.zeros((input_id.shape[0],1,1)).astype(self.image_feature_dtype)
+            if feats is None:
+                feats = np.zeros((input_id.shape[0],1,1,1)).astype(self.image_feature_dtype)
+            if feat_path is None:
+                feat_path = np.empty((input_id.shape[0], 1), self.feature_path_dtype)
             image_feat_tensor = pb_utils.Tensor( "IMAGE_FEATURE", feats)
+            feature_path_tensor = pb_utils.Tensor( "FEATURE_PATH", feat_path)
             output_tensors = [
                     input_id_tensor,
                     bad_words_ids_tensor,
@@ -222,7 +252,8 @@ class TritonPythonModel:
                     request_input_len_tensor,
                     request_output_len_tensor,
                     embedding_bias_tensor,
-                    image_feat_tensor
+                    feature_path_tensor,
+                    image_feat_tensor,
                 ]
             inference_response = pb_utils.InferenceResponse(
                 output_tensors=output_tensors

@@ -25,14 +25,20 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "work_item.h"
+// #define USE_DGTRT
 #ifdef USE_DGTRT
+#include <fstream>
+#include <cstdio>
 #include "storage.h"
 #define DGTRT_DBG 0
 #if DGTRT_DBG
 #include <unistd.h>
 #endif
 #endif
-
+static uint64_t now() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>
+                (std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+}
 namespace triton::backend::inflight_batcher_llm
 {
 
@@ -60,7 +66,7 @@ WorkItem::~WorkItem()
     {
         TRITONBACKEND_ResponseFactoryDelete(factory_ptr_);
     }
-#if USE_DGTRT
+#ifdef USE_DGTRT
     for(auto id : mStorageIds) {
         dg::pop_request_storage(id);
     }
@@ -112,18 +118,85 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
         uint32_t buffer_count = 0;
         TRITONBACKEND_InputProperties(input, &input_name, &data_type, &shape, &dims_count, &byte_size, &buffer_count);
 #if DGTRT_DBG
-        printf(">> backend pid %d\n", (int)getpid());
         printf("input name %s data type %d dims %u byte size %d buf cnt %u\n", input_name, int(data_type),
             dims_count, int(byte_size), buffer_count);
 #endif
+        if (std::string(input_name) == "feature_path")
+        {
+            std::shared_ptr<uint8_t> buf(new uint8_t[byte_size]);
+            uint64_t buffer_offset = 0;
+            for (int64_t buffer_id = 0; buffer_id < buffer_count; ++buffer_id)
+            {
+                const void* buffer = 0L;
+                uint64_t buffer_byte_size = 0;
+                TRITONSERVER_MemoryType memory_type = TRITONSERVER_MEMORY_CPU;
+                int64_t memory_type_id = 0;
+                TRITONBACKEND_InputBuffer(input, buffer_id, &buffer, &buffer_byte_size, &memory_type, &memory_type_id);
+                assert((memory_type == TRITONSERVER_MEMORY_CPU) || (memory_type == TRITONSERVER_MEMORY_CPU_PINNED));
+                // printf("featpath buf offset %d byte sz %d src %p dst %p\n", int(buffer_offset), int(buffer_byte_size), buffer,
+                //     buf.get() + buffer_offset);
+                std::memcpy(buf.get() + buffer_offset, buffer, buffer_byte_size);
+                buffer_offset += buffer_byte_size;
+            }
+
+            std::vector<std::string> strs;
+            auto p = (char*) (buf.get());
+            auto end = p + byte_size;
+            // python bytes starts with an int for length
+            for (auto k = 0; k < byte_size; k++) {
+                printf("%d: %d\n", k, int(p[k]));
+            }
+            while (p < end) {
+                int len = 0;
+                memcpy(&len, p, sizeof(int));
+                p+=4;
+                if (len > 0) strs.push_back(std::string(p, len));
+                p += len;
+            }
+            for (auto &s : strs) {
+                if (s == "None") {
+                    continue;
+                }
+                auto pos = s.find(":");
+                if (pos == std::string::npos) {
+                    throw std::runtime_error(std::string("expect featsz:npy, but got") + s);
+                }
+                auto strsz = s.substr(0, pos);
+                int fsz = std::stoi(strsz);
+                if (featsize == 0) {
+                    featsize = fsz;
+                } else if(featsize != fsz) {
+                    throw std::runtime_error(std::string("feature size not match"));
+                }
+                auto npy = s.substr(pos+1);
+                // std::cout << "load npy " << npy << std::endl;
+                std::ifstream ifs(npy, std::ios::binary);
+                if (!ifs) {
+                    throw std::runtime_error(std::string("Could not open feature file: ") + npy);
+                }
+                ifs.seekg(0, std::ios::end);
+                auto sz = ifs.tellg();
+                ifs.seekg(0, std::ios::beg);
+
+                // std::cout << "file sz " << sz << std::endl;
+
+                std::shared_ptr<uint8_t> sp(new uint8_t[sz]);
+                ifs.read((char *)sp.get(), sz);
+                ifs.close();
+                // std::remove(npy.c_str());
+                auto id = dg::add_request_storage(sp);
+                // std::cout << "id: " << id << std::endl;
+                mStorageIds.push_back(id);
+            }
+        }
         if (std::string(input_name) == "image_features")
         {
             int hiddenSize = (int)shape[dims_count - 1]; // shape: [batch, nimg, nfeat, hidden]
-            featsize = shape[dims_count - 2];
-            int nimg = shape[dims_count - 3];
             int hiddenBytes = hiddenSize * TRITONSERVER_DataTypeByteSize(data_type);
             if (byte_size > (uint64_t)hiddenBytes)
             {
+                featsize = shape[dims_count - 2];
+                int nimg = shape[dims_count - 3];
                 auto imgsz = byte_size / nimg;
 #if DGTRT_DBG
                 printf("nimg %d imgsz %d featsz %d\n", int(nimg), int(imgsz), int(featsize));
@@ -159,6 +232,8 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
 #endif
                 }
             }
+        }
+        if (!mStorageIds.empty()) {
             break;
         }
     }
@@ -184,11 +259,13 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
             || std::string(input_name) == kStreamingInputTensorName
 #ifdef USE_DGTRT
             || std::string(input_name) == "image_features"
+            || std::string(input_name) == "feature_path"
 #endif
         )
         {
             continue;
         }
+        // printf("input name %s\n", input_name);
 
         std::vector<int64_t> shapev;
         for (uint32_t i = 0; i < dims_count; ++i)
@@ -223,7 +300,7 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
                 {
                     p[i + 1] = featsize;
                     p[i + 2] = mStorageIds[storeidx++];
-                    i += featsize;
+                    i += featsize-2;
                 }
             }
         }
