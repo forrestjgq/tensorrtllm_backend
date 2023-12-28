@@ -143,9 +143,6 @@ std::shared_ptr<tensorrt_llm::batch_manager::InferenceRequest> WorkItem::createI
             auto p = (char*) (buf.get());
             auto end = p + byte_size;
             // python bytes starts with an int for length
-            for (auto k = 0; k < byte_size; k++) {
-                printf("%d: %d\n", k, int(p[k]));
-            }
             while (p < end) {
                 int len = 0;
                 memcpy(&len, p, sizeof(int));

@@ -19,7 +19,6 @@ from enum import auto, Enum
 from typing import List, Tuple
 import dgtrt
 import numpy as np
-import grequests
 
 _debug = False
 
@@ -654,6 +653,7 @@ class CLIPVisionTower(nn.Module):
 
     def load_image(self, image_file):
         if image_file.startswith("http") or image_file.startswith("https"):
+            print(f'download {image_file}')
             response = requests.get(image_file)
             image = Image.open(BytesIO(response.content)).convert("RGB")
         elif len(image_file) < 1024 and pathlib.Path(image_file).exists():
@@ -957,7 +957,6 @@ def send_request(req):
     pr = s.prepare_request(req)
     return s.send(pr, timeout=10)
 
-use_grequest = False
 # create request with vega
 def create_request_vega(tk: Tokenizer,  query, images, pad_id, hidden, vega_url):
     """
@@ -989,13 +988,9 @@ def create_request_vega(tk: Tokenizer,  query, images, pad_id, hidden, vega_url)
         raise Exception("feat or size not found in vega response")
     
     start = time.time()
-    if use_grequest:
-        reqs = [grequests.post(url, json={'image': img}, headers={'Content-Type': 'application/json'}, timeout=10) for img in eles]
-        results = [parse(rsp) for rsp in grequests.map(reqs)] # tuple (feat path, element size)
-    else:
-        reqs = [requests.Request(method="POST", url=url, json={'image': img}, headers={'Content-Type': 'application/json'}) for img in eles]
-        futures = [executor.submit(send_request, req) for req in reqs]
-        results = [parse(future.result()) for future in as_completed(futures)]
+    reqs = [requests.Request(method="POST", url=url, json={'image': img}, headers={'Content-Type': 'application/json'}) for img in eles]
+    futures = [executor.submit(send_request, req) for req in reqs]
+    results = [parse(future.result()) for future in as_completed(futures)]
     end = time.time()
     print(f"vega proc takes {int(1000*(end-start))}ms")
     featsz = results[0][1] // hidden
