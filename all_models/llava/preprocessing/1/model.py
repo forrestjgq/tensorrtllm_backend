@@ -99,15 +99,20 @@ class TritonPythonModel:
         self.llava = tokenizer_dir
             
         if self.schema == "vision_tower":
-            with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
-                js = json.load(fp)
-                wmap = js["weight_map"]
-                bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
-                assert len(bins) == 1
-                mmw = os.path.join(self.llava, bins.pop())
-                sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
-                print(f"loading vision tower to device {sdevice}")
-                self.vt = CLIPVisionTower(self.llava, mmw, torch.device(sdevice))
+            sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
+            if False:
+                # in old days, projector weight stays inside llava model weights bin files
+                # so the original model is required for mm projector loading
+                with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
+                    js = json.load(fp)
+                    wmap = js["weight_map"]
+                    bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
+                    assert len(bins) == 1
+                    mmw = os.path.join(self.llava, bins.pop())
+                    print(f"loading vision tower to device {sdevice}")
+                    self.vt = CLIPVisionTower(self.llava,  torch.device(sdevice), mm_weight_path=mmw)
+            else:
+                self.vt = CLIPVisionTower(self.llava, torch.device(sdevice))
         elif self.schema == 'input_feature':
             self.vt = None
         self.tk = Tokenizer(self.llava)

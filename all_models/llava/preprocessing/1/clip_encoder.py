@@ -585,7 +585,7 @@ class Tokenizer:
         return s
 
 class CLIPVisionTower(nn.Module):
-    def __init__(self, llava_model_path: str, mm_weight_path, device, vision_tower_path = None):
+    def __init__(self, llava_model_path: str,  device,mm_weight_path = None, vision_tower_path = None):
         super().__init__()
 
         with open(pathlib.Path(llava_model_path)/'config.json', 'r') as fp:
@@ -600,23 +600,33 @@ class CLIPVisionTower(nn.Module):
         self.vision_tower = CLIPVisionModel.from_pretrained(vision_tower_path)
 
         self.mm_projector = build_vision_projector(self.llava_config)
-        params = self.mm_projector.named_parameters()
-        prefix = 'model.mm_projector.'
-        if _debug: print(f"mm proj params:")
-        keys = []
-        for name, _ in params:
-            if _debug: print('\t', name)
-            keys.append(name)
-        if _debug: print('keys', keys)
-        # see llava_arch.py
-        with open(mm_weight_path, 'r') as fp:
+
+        if mm_weight_path is None:
+            # mm projector weight is extracted from llava weights and 
+            # saved in engine-dir/model/mm_projector.bin in model building
+            # see build_model.py
+            mm_weight_path = os.path.join(llava_model_path, 'mm_projector.bin')
+            assert os.path.exists(mm_weight_path)
+            w = torch.load(mm_weight_path)
+        else:
+            # in old days, projector weight stays inside llava model weights bin files
+            # so the original model is required for mm projector loading
+            params = self.mm_projector.named_parameters()
+            prefix = 'model.mm_projector.'
+            if _debug: print(f"mm proj params:")
+            keys = []
+            for name, _ in params:
+                if _debug: print('\t', name)
+                keys.append(name)
+            if _debug: print('keys', keys)
+            # see llava_arch.py
             w = torch.load(mm_weight_path)
             if _debug: print(f'type weight: {type(w)}')
             w = {k: w[prefix+k] for k in keys}
             if _debug:
                 for k in w.keys():
                     print('\t', k)
-            self.mm_projector.load_state_dict(w)
+        self.mm_projector.load_state_dict(w)
 
         self.to(device, dtype=torch.float16)
         self.requires_grad_(False)
