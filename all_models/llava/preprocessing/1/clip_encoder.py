@@ -663,7 +663,6 @@ class CLIPVisionTower(nn.Module):
 
     def load_image(self, image_file):
         if image_file.startswith("http") or image_file.startswith("https"):
-            print(f'download {image_file}')
             response = requests.get(image_file)
             image = Image.open(BytesIO(response.content)).convert("RGB")
         elif len(image_file) < 1024 and pathlib.Path(image_file).exists():
