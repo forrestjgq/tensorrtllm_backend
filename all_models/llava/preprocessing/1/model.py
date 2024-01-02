@@ -60,6 +60,7 @@ class TritonPythonModel:
         tokenizer_dir = params["tokenizer_dir"]["string_value"]
         self.schema = params["schema"]["string_value"]
         self.hidden_size = int(params["hidden_size"]["string_value"])
+        self.max_input_length = int(params["max_input_len"]["string_value"])
         # tokenizer_type = model_config['parameters']['tokenizer_type'][
         #     'string_value']
 
@@ -219,6 +220,18 @@ class TritonPythonModel:
                     raise Exception(f'unknown schema {self.schema}') 
             else:
                 input_id, request_input_len = create_request_noimg(self.tk, query, self.pad_id)
+            
+            # check input size
+            if any(request_input_len > self.max_input_length):
+                err_str = (f"input token size {request_input_len} exceeds max input length {self.max_input_length}")
+                logger.log_error(err_str)
+                responses.append(
+                    pb_utils.InferenceResponse(
+                        output_tensors=[], error=pb_utils.TritonError(err_str)
+                    )
+                )
+                continue
+
             bad_words = self._to_word_list_format(bad_words_dict)
             stop_words = self._to_word_list_format(stop_words_dict)
 

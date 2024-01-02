@@ -511,7 +511,7 @@ class Tokenizer:
                 return torch.tensor(input_ids, dtype=torch.long)
             raise ValueError(f'Unsupported tensor type: {return_tensors}')
         return input_ids
-    def encode_text(self,query: str):
+    def encode_text_old(self,query: str):
         #   feat: list of tuple(storage-id, block-size)
         qs = query
         if IMAGE_PLACEHOLDER in qs:
@@ -531,6 +531,8 @@ class Tokenizer:
         prompt = conv.get_prompt()
         # print(f'prompt {prompt}')
 
+        return self.tokenizer_image_token(prompt, IMAGE_TOKEN_INDEX)
+    def encode_text(self,prompt: str):
         return self.tokenizer_image_token(prompt, IMAGE_TOKEN_INDEX)
     def encode_with_stored_feature(self,query: str, feats):
         #   feat: list of tuple(storage-id, block-size)
@@ -867,7 +869,7 @@ class CLIPVisionTower(nn.Module):
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
-def decode_image(vt, images, store = False):
+def decode_image(vt: CLIPVisionTower, images, store = False):
     feats = vt.encode_images(images).to(torch.device("cpu")).numpy()
     if _debug: print(f"feat shape {feats.shape}")
     if store:
@@ -1033,17 +1035,18 @@ def create_request_feat(tk: Tokenizer,  query, features, featsize, pad_id, hidde
 if __name__ == "__main__":
     _debug = True
     dgtrt.enable_request_storage()
-    llava='/data/jgq/tmpfs/llava-v1.5-7b'
-    mmw = llava+'/pytorch_model-00002-of-00002.bin'
-    device=torch.device('cuda:2')
+    llava='/data/jgq/tmpfs/llava-v1.5-13b-engine1/model'
+    device=torch.device('cuda:4')
     cpu = torch.device('cpu')
     tk = Tokenizer(llava)
+    
     pad_id = tk.tokenizer.encode(
         tk.tokenizer.pad_token, add_special_tokens=False
     )[0]
+    vt = CLIPVisionTower(llava, device)
     prompt = [[b"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER:What did you see in this image? and how are you feeling?<image-placeholder><image-placeholder> ASSISTANT:"]]
     image_file = [[b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg", b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg"]]
-    ids, lens, feats = create_request_vega(tk,  prompt, image_file, pad_id, 5120, '127.0.0.1:5000')
+    ids, lens, feats = create_request_vision_tower(tk,  vt, prompt, image_file, pad_id)
     print('ids ', ids)
     print('lens ', lens)
     print('feats ', feats)

@@ -41,6 +41,7 @@
 #include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 
 #include "model_state.h"
 #include "work_item.h"
@@ -49,6 +50,7 @@
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::batch_manager::batch_scheduler;
 using namespace tensorrt_llm::mpi;
+using namespace tensorrt_llm::runtime;
 
 namespace triton::backend::inflight_batcher_llm
 {
@@ -122,6 +124,7 @@ private:
 
     TrtGptModelType mTrtGptModelType;
     std::string mModelPath;
+    bool mExcludeInputInOutput;
     bool mIsDecoupled;
 
     std::shared_ptr<GptManager> mBatchManager;
