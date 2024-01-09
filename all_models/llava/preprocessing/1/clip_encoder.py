@@ -663,7 +663,7 @@ class CLIPVisionTower(nn.Module):
             new_images = torch.stack(new_images, dim=0)
         return new_images
 
-    def load_image(self, image_file):
+    def load_image(self, image_file: str):
         if image_file.startswith("http") or image_file.startswith("https"):
             response = requests.get(image_file)
             image = Image.open(BytesIO(response.content)).convert("RGB")
@@ -671,6 +671,12 @@ class CLIPVisionTower(nn.Module):
             image = Image.open(image_file).convert("RGB")
         else:
             # treat as base64
+            if image_file.startswith("data:image"):
+                sub = "base64,"
+                idx = image_file.find(sub)
+                if idx < 0:
+                    raise RuntimeError("expect 'data:image/xxx;base64,' for image but not found")
+                image_file = image_file[idx + len(sub)].strip()
             image = self.load_image_from_base64(image_file)
         return image
 
