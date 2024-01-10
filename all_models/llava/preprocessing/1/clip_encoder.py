@@ -676,7 +676,7 @@ class CLIPVisionTower(nn.Module):
                 idx = image_file.find(sub)
                 if idx < 0:
                     raise RuntimeError("expect 'data:image/xxx;base64,' for image but not found")
-                image_file = image_file[idx + len(sub)].strip()
+                image_file = image_file[idx + len(sub):].strip()
             image = self.load_image_from_base64(image_file)
         return image
 
