@@ -1,4 +1,4 @@
-// Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,6 +28,7 @@
 #define _GLIBCXX_USE_CXX11_ABI 0
 
 #include <nlohmann/json.hpp>
+#include <unordered_map>
 
 #include "triton/backend/backend_common.h"
 #include "triton/core/tritonbackend.h"
@@ -77,6 +78,11 @@ public:
         // terminate decoupled execution loop
         {
             mWorkItemsQueue->clear();
+        }
+
+        // signal batch manager to stop processing the work items queue
+        {
+            mBatchManager->shutdown();
         }
     }
 
@@ -129,6 +135,8 @@ private:
 
     std::shared_ptr<GptManager> mBatchManager;
     std::unique_ptr<WorkItemsQueue> mWorkItemsQueue;
+
+    std::unordered_map<uint64_t, std::string> mRequestIdStrMap;
 };
 
 } // namespace triton::backend::inflight_batcher_llm
