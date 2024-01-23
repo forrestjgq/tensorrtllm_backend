@@ -44,6 +44,11 @@ output [
     name: "OUTPUT"
     data_type: TYPE_STRING
     dims: [ -1 ]
+  },
+  {
+    name: "TOKENS"
+    data_type: TYPE_UINT32
+    dims: [ 1 ]
   }
 ]
 

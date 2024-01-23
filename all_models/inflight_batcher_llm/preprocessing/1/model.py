@@ -1,4 +1,4 @@
-# Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -27,9 +27,11 @@
 import json
 from typing import List
 
+import os
 import numpy as np
 import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
+from clip_encoder import Tokenizer, CLIPVisionTower, create_request_vision_tower, create_request_noimg, create_request_feat
 
 
 class TritonPythonModel:
@@ -54,12 +56,33 @@ class TritonPythonModel:
         """
         # Parse model configs
         model_config = json.loads(args['model_config'])
+		
+        params = model_config["parameters"]
+        self.schema = params["schema"]["string_value"]
+        self.hidden_size = int(params["hidden_size"]["string_value"])
+        self.max_input_length = int(params["max_input_len"]["string_value"])
+        self.model_name = params["model_name"]["string_value"]
+		
         tokenizer_dir = model_config['parameters']['tokenizer_dir'][
             'string_value']
         tokenizer_type = model_config['parameters']['tokenizer_type'][
             'string_value']
+        self.add_special_tokens = model_config['parameters'].get(
+            'add_special_tokens',
+            {'string_value': "false"})['string_value'].lower() in [
+                'true', '1', 't', 'y', 'yes'
+            ]
 
-        if tokenizer_type == 't5':
+        if 'llava' in self.model_name.lower():
+            # llava start
+            self.llava = tokenizer_dir
+            self.vt = None # vision tower
+            if self.schema == "vision_tower":
+                sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
+                self.vt = CLIPVisionTower(self.llava, sdevice)
+            self.tk = Tokenizer(self.llava)
+            self.tokenizer = self.tk.tokenizer
+        elif tokenizer_type == 't5':
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
                                          padding_side='left')
         elif tokenizer_type == 'chatglm':
@@ -70,25 +93,31 @@ class TritonPythonModel:
                                                            use_fast=False,
                                                            trust_remote_code=True)
         elif tokenizer_type == 'auto':
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
-                                                           padding_side='left')
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir, padding_side='left', trust_remote_code=True)
         elif tokenizer_type == 'llama':
             self.tokenizer = LlamaTokenizer.from_pretrained(
                 tokenizer_dir, legacy=False, padding_side='left')
         else:
             raise AttributeError(
                 f'Unexpected tokenizer type: {tokenizer_type}')
+
         if tokenizer_type == 'chatglm':
-            self.pad_id = self.tokenizer.pad_token_id
-            self.end_id = self.tokenizer.eos_token_id
+            self.tokenizer_pad_id = self.tokenizer.pad_token_id
+            self.tokenizer_end_id = self.tokenizer.eos_token_id
         else:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.pad_id = self.tokenizer.encode(self.tokenizer.pad_token,
-                                                add_special_tokens=False)[0]
+            self.tokenizer_end_id = self.tokenizer.encode(
+                self.tokenizer.eos_token, add_special_tokens=False)[0]
+            self.tokenizer_pad_id = self.tokenizer.encode(
+                self.tokenizer.pad_token, add_special_tokens=False)[0]
 
         # Parse model output configs and convert Triton types to numpy types
         output_names = [
-            "INPUT_ID", "REQUEST_INPUT_LEN", "BAD_WORDS_IDS", "STOP_WORDS_IDS"
+            "INPUT_ID", "REQUEST_INPUT_LEN", "BAD_WORDS_IDS", "STOP_WORDS_IDS",
+            "OUT_END_ID", "OUT_PAD_ID",
+            "IMAGE_FEATURE",
+            "FEATURE_PATH"
         ]
         input_names = ["EMBEDDING_BIAS_WORDS", "EMBEDDING_BIAS_WEIGHTS"]
         for input_name in input_names:
@@ -106,6 +135,7 @@ class TritonPythonModel:
                 pb_utils.triton_string_to_numpy(
                     pb_utils.get_output_config_by_name(
                         model_config, output_name)['data_type']))
+
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -150,6 +180,20 @@ class TritonPythonModel:
             request_output_len = pb_utils.get_input_tensor_by_name(
                 request, 'REQUEST_OUTPUT_LEN').as_numpy()
 
+            # multimodel processing
+            images = None
+            feat_size = None
+            
+            # llava
+            if 'llava' in self.model_name.lower():
+                images = pb_utils.get_input_tensor_by_name(request, "IMAGES")
+                feat_size = pb_utils.get_input_tensor_by_name(request, "FEATURE_SIZE")
+
+            if images is not None:
+                images = images.as_numpy()
+            if feat_size is not None:
+                feat_size = feat_size.as_numpy()
+
             bad_words_dict = pb_utils.get_input_tensor_by_name(
                 request, 'BAD_WORDS_DICT')
             if bad_words_dict is not None:
@@ -170,8 +214,56 @@ class TritonPythonModel:
             if embedding_bias_weights is not None:
                 embedding_bias_weights = embedding_bias_weights.as_numpy()
 
+            # Take the end_id from the input tensors
+            # If not specified, use tokenizer to get end_id
+            end_id = pb_utils.get_input_tensor_by_name(request, 'END_ID')
+            if end_id is not None:
+                end_id = end_id.as_numpy()
+            else:
+                end_id = [[self.tokenizer_end_id]]
+
+            # Take the pad_id from the input tensors
+            # If not specified, use tokenizer to get pad_id
+            pad_id = pb_utils.get_input_tensor_by_name(request, 'PAD_ID')
+            if pad_id is not None:
+                pad_id = pad_id.as_numpy()
+            else:
+                pad_id = [[self.tokenizer_pad_id]]
+
             # Preprocessing input data.
-            input_id, request_input_len = self._create_request(query)
+            if 'llava' in self.model_name.lower():
+                #llava
+                feats = None # deliver feature data to next model
+                feat_path = None # save feature to a file and deliver file path to next model
+                if images is not None:
+                    if self.schema == 'input_feature':
+                        # input feature requires feature size and feature file path, 
+                        # feature size is used to insert placeholders into input-ids
+                        # feature file will be loaded inside trtllm backend and saved
+                        # for lookup-plugin
+                        assert feat_size is not None
+                        input_id, request_input_len, feat_path = create_request_feat(self.tk, query, images, feat_size[0][0], self.tokenizer_pad_id, self.hidden_size)
+                    elif self.schema == 'vision_tower':
+                        assert self.vt is not None
+                        input_id, request_input_len, feats = create_request_vision_tower(self.tk, self.vt, query, images, self.tokenizer_pad_id)
+                        feats = np.array(feats, dtype=self.image_feature_dtype)
+                    else:
+                        raise Exception(f'unknown schema {self.schema}') 
+                else:
+                    input_id, request_input_len = create_request_noimg(self.tk, query, self.tokenizer_pad_id)
+            else:
+                input_id, request_input_len = self._create_request(query)
+            
+            # jgq: check input size, request will fail if it exceeds max input length
+            if any(request_input_len > self.max_input_length):
+                err_str = (f"input token size {request_input_len} exceeds max input length {self.max_input_length}")
+                logger.log_error(err_str)
+                responses.append(
+                    pb_utils.InferenceResponse(
+                        output_tensors=[], error=pb_utils.TritonError(err_str)
+                    )
+                )
+                continue
             bad_words = self._to_word_list_format(bad_words_dict)
             stop_words = self._to_word_list_format(stop_words_dict)
 
@@ -193,11 +285,26 @@ class TritonPythonModel:
                                                     stop_words)
             embedding_bias_tensor = pb_utils.Tensor('EMBEDDING_BIAS',
                                                     embedding_bias)
+            end_id_tensor = pb_utils.Tensor('OUT_END_ID',
+                                            np.array(end_id, dtype=np.int32))
+            pad_id_tensor = pb_utils.Tensor('OUT_PAD_ID',
+                                            np.array(pad_id, dtype=np.int32))
 
+			# llava
+            if feats is None:
+                feats = np.zeros((input_id.shape[0],1,1,1)).astype(self.image_feature_dtype)
+            if feat_path is None:
+                feat_path = np.empty((input_id.shape[0], 1), self.feature_path_dtype)
+            image_feat_tensor = pb_utils.Tensor( "IMAGE_FEATURE", feats)
+            feature_path_tensor = pb_utils.Tensor( "FEATURE_PATH", feat_path)
+			
             inference_response = pb_utils.InferenceResponse(output_tensors=[
                 input_id_tensor, bad_words_ids_tensor, stop_words_ids_tensor,
                 request_input_len_tensor, request_output_len_tensor,
-                embedding_bias_tensor
+                embedding_bias_tensor, 
+				end_id_tensor, pad_id_tensor,
+                feature_path_tensor,
+                image_feat_tensor,
             ])
             responses.append(inference_response)
 
@@ -217,7 +324,10 @@ class TritonPythonModel:
             query : batch string (2D numpy array)
         """
         start_ids = [
-            np.array(self.tokenizer.encode(s[0].decode())).astype(int)
+            np.array(
+                self.tokenizer.encode(
+                    s[0].decode(),
+                    add_special_tokens=self.add_special_tokens)).astype(int)
             for s in query
         ]
         start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
@@ -228,7 +338,8 @@ class TritonPythonModel:
         start_ids = np.stack([
             np.pad(seq, (0, max_len - seq.shape[0]),
                    'constant',
-                   constant_values=(0, self.pad_id)) for seq in start_ids
+                   constant_values=(0, self.tokenizer_pad_id))
+            for seq in start_ids
         ])
 
         return start_ids, start_lengths

@@ -1,5 +1,5 @@
 <!--
-# Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -41,20 +41,22 @@ available in the main [server](https://github.com/triton-inference-server/server
 repo. If you don't find your answer there you can ask questions on the
 [issues page](https://github.com/triton-inference-server/tensorrtllm_backend/issues).
 
-## Building the TensorRT-LLM Backend
+## Accessing the TensorRT-LLM Backend
 
 There are several ways to access the TensorRT-LLM Backend.
 
-**Before Triton 23.10 release, please use [Option 3 to build TensorRT-LLM backend via Docker](#option-3-build-via-docker)**
+**Before Triton 23.10 release, please use [Option 3 to build TensorRT-LLM backend via Docker](#option-3-build-via-docker).**
 
-### Option 1. Run the Docker Container
+### Run the Pre-built Docker Container
 
 Starting with Triton 23.10 release, Triton includes a container with the TensorRT-LLM
 Backend and Python Backend. This container should have everything to run a
 TensorRT-LLM model. You can find this container on the
 [Triton NGC page](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver).
 
-### Option 2. Build via the build.py Script in Server Repo
+### Build the Docker Container
+
+#### Option 1. Build via the `build.py` Script in Server Repo
 
 Starting with Triton 23.10 release, you can follow steps described in the
 [Building With Docker](https://github.com/triton-inference-server/server/blob/main/docs/customization_guide/build.md#building-with-docker)
@@ -90,7 +92,7 @@ the TensorRT-LLM backend and Python backend repositories that will be used
 to build the container. You can also remove the features or endpoints that you
 don't need by removing the corresponding flags.
 
-### Option 3. Build via Docker
+#### Option 2. Build via Docker
 
 The version of Triton Server used in this build option can be found in the
 [Dockerfile](./dockerfile/Dockerfile.trt_llm_backend).
@@ -162,16 +164,26 @@ python3 build.py --model_dir=./c-model/gpt2/4-gpu/ \
 
 ### Create the model repository
 
-There are four models in the [`all_models/inflight_batcher_llm`](./all_models/inflight_batcher_llm/)
+There are five models in the [`all_models/inflight_batcher_llm`](./all_models/inflight_batcher_llm/)
 directory that will be used in this example:
-- "preprocessing": This model is used for tokenizing, meaning the conversion from prompts(string) to input_ids(list of ints).
-- "tensorrt_llm": This model is a wrapper of your TensorRT-LLM model and is used for inferencing
-- "postprocessing": This model is used for de-tokenizing, meaning the conversion from output_ids(list of ints) to outputs(string).
-- "ensemble": This model is used to chain the three models above together:
-preprocessing -> tensorrt_llm -> postprocessing
+- "preprocessing": This model is used for tokenizing, meaning the conversion from
+prompts(string) to input_ids(list of ints).
+- "tensorrt_llm": This model is a wrapper of your TensorRT-LLM model and is used
+for inferencing
+- "postprocessing": This model is used for de-tokenizing, meaning the conversion
+from output_ids(list of ints) to outputs(string).
+- "ensemble": This model can be used to chain the preprocessing, tensorrt_llm
+and postprocessing models together.
+- "tensorrt_llm_bls": This model can also be used to chain the preprocessing,
+tensorrt_llm and postprocessing models together. The BLS model has an optional
+parameter `accumulate_tokens` which can be used in streaming mode to call the
+preprocessing model with all accumulated tokens, instead of only one token.
+This might be necessary for certain tokenizers.
 
-To learn more about ensemble model, please see
-[here](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#ensemble-models).
+To learn more about ensemble and BLS models, please see the
+[Ensemble Models](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/architecture.md#ensemble-models)
+and [Business Logic Scripting](https://github.com/triton-inference-server/python_backend#business-logic-scripting)
+sections of the Triton Inference Server documentation.
 
 ```bash
 # Create the model repository that will be used by the Triton server
@@ -186,7 +198,7 @@ cp tensorrt_llm/examples/gpt/engines/fp16/4-gpu/* triton_model_repo/tensorrt_llm
 ```
 
 ### Modify the model configuration
-The following table shows the fields that need to be modified before deployment:
+The following table shows the fields that may to be modified before deployment:
 
 *triton_model_repo/preprocessing/config.pbtxt*
 
@@ -199,9 +211,18 @@ The following table shows the fields that need to be modified before deployment:
 
 | Name | Description
 | :----------------------: | :-----------------------------: |
-| `decoupled` | Controls streaming. Decoupled mode must be set to `True` if using the streaming option from the client. |
-| `gpt_model_type` | Set to `inflight_fused_batching` when enabling in-flight batching support. To disable in-flight batching, set to `V1` |
-| `gpt_model_path` | Path to the TensorRT-LLM engines for deployment. In this example, the path should be set to `/tensorrtllm_backend/triton_model_repo/tensorrt_llm/1` as the tensorrtllm_backend directory will be mounted to `/tensorrtllm_backend` within the container |
+| `gpt_model_type` | Mandatory. Set to `inflight_fused_batching` when enabling in-flight batching support. To disable in-flight batching, set to `V1` |
+| `gpt_model_path` | Mandatory. Path to the TensorRT-LLM engines for deployment. In this example, the path should be set to `/tensorrtllm_backend/triton_model_repo/tensorrt_llm/1` as the tensorrtllm_backend directory will be mounted to `/tensorrtllm_backend` within the container |
+| `batch_scheduler_policy` | Mandatory. Set to `max_utilization` to greedily pack as many requests as possible in each current in-flight batching iteration. This maximizes the throughput but may result in overheads due to request pause/resume if KV cache limits are reached during execution. Set to `guaranteed_no_evict` to guarantee that a started request is never paused.|
+| `decoupled` | Optional (default=`false`). Controls streaming. Decoupled mode must be set to `True` if using the streaming option from the client. |
+| `max_beam_width` | Optional (default=1). The maximum beam width that any request may ask for when using beam search.|
+| `max_tokens_in_paged_kv_cache` | Optional (default=unspecified). The maximum size of the KV cache in number of tokens. If unspecified, value is interpreted as 'infinite'. KV cache allocation is the min of max_tokens_in_paged_kv_cache and value derived from kv_cache_free_gpu_mem_fraction below. |
+| `max_attention_window_size` | Optional (default=max_sequence_length). When using techniques like sliding window attention, the maximum number of tokens that are attended to generate one token. Defaults attends to all tokens in sequence. |
+| `kv_cache_free_gpu_mem_fraction` | Optional (default=0.9). Set to a number between 0 and 1 to indicate the maximum fraction of GPU memory (after loading the model) that may be used for KV cache.|
+| `max_num_sequences` | Optional (default=`max_batch_size` if `enable_trt_overlap` is `false` and to `2 * max_batch_size` if `enable_trt_overlap` is `true`, where `max_batch_size` is the TRT engine maximum batch size). Maximum number of sequences that the in-flight batching scheme can maintain state for.
+| `enable_trt_overlap` | Optional (default=`false`). Set to `true` to partition available requests into 2 'microbatches' that can be run concurrently to hide exposed CPU runtime |
+| `exclude_input_in_output` | Optional (default=`false`). Set to `true` to only return completion tokens in a response. Set to `false` to return the prompt tokens concatenated with the generated tokens  |
+| `normalize_log_probs` | Optional (default=`true`). Set to `false` to skip normalization of `output_log_probs`  |
 
 *triton_model_repo/postprocessing/config.pbtxt*
 
@@ -258,8 +279,8 @@ environment/container:
 curl -X POST localhost:8000/v2/models/${MODEL_NAME}/generate -d '{"{PARAM1_KEY}": "{PARAM1_VALUE}", ... }'
 ```
 
-In the case of the models used in this example, you can replace MODEL_NAME with `ensemble`. Examining the
-ensemble model's config.pbtxt file, you can see that 4 parameters are required to generate a response
+In the case of the models used in this example, you can replace MODEL_NAME with `ensemble` or `tensorrt_llm_bls`. Examining the
+`ensemble` and `tensorrt_llm_bls` model's config.pbtxt file, you can see that 4 parameters are required to generate a response
 for this model:
 
 - "text_input": Input text to generate a response from
@@ -272,6 +293,11 @@ Therefore, we can query the server in the following way:
 ```bash
 curl -X POST localhost:8000/v2/models/ensemble/generate -d '{"text_input": "What is machine learning?", "max_tokens": 20, "bad_words": "", "stop_words": ""}'
 ```
+if using the `ensemble` model or
+```
+curl -X POST localhost:8000/v2/models/tensorrt_llm_bls/generate -d '{"text_input": "What is machine learning?", "max_tokens": 20, "bad_words": "", "stop_words": ""}'
+```
+if using the `tensorrt_llm_bls` model.
 
 Which should return a result similar to (formatted for readability):
 ```json
@@ -292,7 +318,7 @@ You can send requests to the "tensorrt_llm" model with the provided
 as following:
 
 ```bash
-python3 inflight_batcher_llm/client/inflight_batcher_llm_client.py --request-output-len 200 --tokenizer_dir /workspace/tensorrtllm_backend/tensorrt_llm/examples/gpt/gpt2
+python3 inflight_batcher_llm/client/inflight_batcher_llm_client.py --request-output-len 200 --tokenizer-dir /workspace/tensorrtllm_backend/tensorrt_llm/examples/gpt/gpt2
 ```
 
 The result should be similar to the following:
@@ -320,14 +346,65 @@ He was a member of the French Academy of Sciences and the French Academy of Arts
 Soyer was a member of the French Academy of Sciences and
 ```
 
-You can also stop the generation process early by using the `--stop-after-ms` option to send a stop request after a few milliseconds:
+#### Early stopping
+You can also stop the generation process early by using the `--stop-after-ms`
+option to send a stop request after a few milliseconds:
 
 ```bash
-python inflight_batcher_llm/client/inflight_batcher_llm_client.py --stop-after-ms 200 --request-output-len 200 --tokenizer_dir /workspace/tensorrtllm_backend/tensorrt_llm/examples/gpt/gpt2
+python inflight_batcher_llm/client/inflight_batcher_llm_client.py --stop-after-ms 200 --request-output-len 200 --tokenizer-dir /workspace/tensorrtllm_backend/tensorrt_llm/examples/gpt/gpt2
 ```
 
-You will find that the generation process is stopped early and therefore the number of generated tokens is lower than 200.
-You can have a look at the client code to see how early stopping is achieved.
+You will find that the generation process is stopped early and therefore the
+number of generated tokens is lower than 200. You can have a look at the
+client code to see how early stopping is achieved.
+
+#### Return context logits and/or generation logits
+If you want to get context logits and/or generation logits, you need to enable `--gather_context_logits` and/or `--gather_generation_logits` when building the engine (or `--enable gather_all_token_logits` to enable both at the same time). For more setting details about these two flags, please refer to [build.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/gpt/build.py) or [gpt_runtime](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/gpt_runtime.md).
+
+After launching the server, you could get the output of logits by passing the corresponding parameters `--return-context-logits` and/or `--return-generation-logits` in the client scripts (`end_to_end_grpc_client.py` and `inflight_batcher_llm_client.py`). For example:
+```bash
+python3 inflight_batcher_llm/client/inflight_batcher_llm_client.py --request-output-len 20 --tokenizer-dir /path/to/tokenizer/ \
+--return-context-logits \
+--return-generation-logits
+```
+
+The result should be similar to the following:
+```
+Input sequence:  [28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257]
+Got completed request
+Input: Born in north-east France, Soyer trained as a
+Output beam 0:  has since worked in restaurants in London,
+Output sequence:  [21221, 878, 3867, 284, 3576, 287, 262, 1903, 6303, 82, 13, 679, 468, 1201, 3111, 287, 10808, 287, 3576, 11]
+context_logits.shape: (1, 12, 50257)
+context_logits: [[[ -65.9822     -62.267445   -70.08991   ...  -76.16964    -78.8893
+    -65.90678  ]
+  [-103.40278   -102.55243   -106.119026  ... -108.925415  -109.408585
+   -101.37687  ]
+  [ -63.971176   -64.03466    -67.58809   ...  -72.141235   -71.16892
+    -64.23846  ]
+  ...
+  [ -80.776375   -79.1815     -85.50916   ...  -87.07368    -88.02817
+    -79.28435  ]
+  [ -10.551408    -7.786484   -14.524468  ...  -13.805856   -15.767286
+     -7.9322424]
+  [-106.33096   -105.58956   -111.44852   ... -111.04858   -111.994194
+   -105.40376  ]]]
+generation_logits.shape: (1, 1, 20, 50257)
+generation_logits: [[[[-106.33096  -105.58956  -111.44852  ... -111.04858  -111.994194
+    -105.40376 ]
+   [ -77.867424  -76.96638   -83.119095 ...  -87.82542   -88.53957
+     -75.64877 ]
+   [-136.92282  -135.02484  -140.96051  ... -141.78284  -141.55045
+    -136.01668 ]
+   ...
+   [-100.03721   -98.98237  -105.25507  ... -108.49254  -109.45882
+     -98.95136 ]
+   [-136.78777  -136.16165  -139.13437  ... -142.21495  -143.57468
+    -134.94667 ]
+   [  19.222942   19.127287   14.804495 ...   10.556551    9.685863
+      19.625107]]]]
+```
+
 
 ### Launch Triton server *within Slurm based clusters*
 
@@ -375,6 +452,93 @@ You might have to contact your cluster's administrator to help you customize the
 
 ```bash
 pkill tritonserver
+```
+
+## Triton Metrics
+Starting with the 23.11 release of Triton, users can now obtain TRT LLM Batch
+Manager [statistics](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/batch_manager.md#statistics)
+by querying the Triton metrics endpoint. This can be accomplished by launching
+a Triton server in any of the ways described above (ensuring the build code /
+container is 23.11 or later) and querying the server. Upon receiving a
+successful response, you can query the metrics endpoint by entering the
+following:
+```bash
+curl localhost:8002/metrics
+```
+Batch manager statistics are reported by the metrics endpoint in fields that
+are prefixed with `nv_trt_llm_`. Your output for these fields should look
+similar to the following (assuming your model is an inflight batcher model):
+```bash
+# HELP nv_trt_llm_request_metrics TRT LLM request metrics
+# TYPE nv_trt_llm_request_metrics gauge
+nv_trt_llm_request_metrics{model="tensorrt_llm",request_type="context",version="1"} 1
+nv_trt_llm_request_metrics{model="tensorrt_llm",request_type="scheduled",version="1"} 1
+nv_trt_llm_request_metrics{model="tensorrt_llm",request_type="max",version="1"} 512
+nv_trt_llm_request_metrics{model="tensorrt_llm",request_type="active",version="1"} 0
+# HELP nv_trt_llm_runtime_memory_metrics TRT LLM runtime memory metrics
+# TYPE nv_trt_llm_runtime_memory_metrics gauge
+nv_trt_llm_runtime_memory_metrics{memory_type="pinned",model="tensorrt_llm",version="1"} 0
+nv_trt_llm_runtime_memory_metrics{memory_type="gpu",model="tensorrt_llm",version="1"} 1610236
+nv_trt_llm_runtime_memory_metrics{memory_type="cpu",model="tensorrt_llm",version="1"} 0
+# HELP nv_trt_llm_kv_cache_block_metrics TRT LLM KV cache block metrics
+# TYPE nv_trt_llm_kv_cache_block_metrics gauge
+nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type="tokens_per",model="tensorrt_llm",version="1"} 64
+nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type="used",model="tensorrt_llm",version="1"} 1
+nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type="free",model="tensorrt_llm",version="1"} 6239
+nv_trt_llm_kv_cache_block_metrics{kv_cache_block_type="max",model="tensorrt_llm",version="1"} 6239
+# HELP nv_trt_llm_inflight_batcher_metrics TRT LLM inflight_batcher-specific metrics
+# TYPE nv_trt_llm_inflight_batcher_metrics gauge
+nv_trt_llm_inflight_batcher_metrics{inflight_batcher_specific_metric="micro_batch_id",model="tensorrt_llm",version="1"} 0
+nv_trt_llm_inflight_batcher_metrics{inflight_batcher_specific_metric="generation_requests",model="tensorrt_llm",version="1"} 0
+nv_trt_llm_inflight_batcher_metrics{inflight_batcher_specific_metric="total_context_tokens",model="tensorrt_llm",version="1"} 0
+# HELP nv_trt_llm_general_metrics General TRT LLM metrics
+# TYPE nv_trt_llm_general_metrics gauge
+nv_trt_llm_general_metrics{general_type="iteration_counter",model="tensorrt_llm",version="1"} 0
+nv_trt_llm_general_metrics{general_type="timestamp",model="tensorrt_llm",version="1"} 1700074049
+```
+If, instead, you launched a V1 model, your output will look similar to the
+output above except the inflight batcher related fields will be replaced
+with something similar to the following:
+```bash
+# HELP nv_trt_llm_v1_metrics TRT LLM v1-specific metrics
+# TYPE nv_trt_llm_v1_metrics gauge
+nv_trt_llm_v1_metrics{model="tensorrt_llm",v1_specific_metric="total_generation_tokens",version="1"} 20
+nv_trt_llm_v1_metrics{model="tensorrt_llm",v1_specific_metric="empty_generation_slots",version="1"} 0
+nv_trt_llm_v1_metrics{model="tensorrt_llm",v1_specific_metric="total_context_tokens",version="1"} 5
+```
+Please note that versions of Triton prior to the 23.12 release do not
+support base Triton metrics. As such, the following fields will report 0:
+```bash
+# HELP nv_inference_request_success Number of successful inference requests, all batch sizes
+# TYPE nv_inference_request_success counter
+nv_inference_request_success{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_request_failure Number of failed inference requests, all batch sizes
+# TYPE nv_inference_request_failure counter
+nv_inference_request_failure{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_count Number of inferences performed (does not include cached requests)
+# TYPE nv_inference_count counter
+nv_inference_count{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_exec_count Number of model executions performed (does not include cached requests)
+# TYPE nv_inference_exec_count counter
+nv_inference_exec_count{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_request_duration_us Cumulative inference request duration in microseconds (includes cached requests)
+# TYPE nv_inference_request_duration_us counter
+nv_inference_request_duration_us{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_queue_duration_us Cumulative inference queuing duration in microseconds (includes cached requests)
+# TYPE nv_inference_queue_duration_us counter
+nv_inference_queue_duration_us{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_compute_input_duration_us Cumulative compute input duration in microseconds (does not include cached requests)
+# TYPE nv_inference_compute_input_duration_us counter
+nv_inference_compute_input_duration_us{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_compute_infer_duration_us Cumulative compute inference duration in microseconds (does not include cached requests)
+# TYPE nv_inference_compute_infer_duration_us counter
+nv_inference_compute_infer_duration_us{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_compute_output_duration_us Cumulative inference compute output duration in microseconds (does not include cached requests)
+# TYPE nv_inference_compute_output_duration_us counter
+nv_inference_compute_output_duration_us{model="tensorrt_llm",version="1"} 0
+# HELP nv_inference_pending_request_count Instantaneous number of pending requests awaiting execution per-model.
+# TYPE nv_inference_pending_request_count gauge
+nv_inference_pending_request_count{model="tensorrt_llm",version="1"} 0
 ```
 
 ## Testing the TensorRT-LLM Backend

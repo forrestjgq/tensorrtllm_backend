@@ -1,6 +1,8 @@
 import json
 import os
 import pathlib
+import time
+from sympy import false
 import torch
 import torch.nn as nn
 import re
@@ -39,13 +41,11 @@ def split_list(lst, value):
     sublist = []
     for element in lst:
         if element == value:
-            if sublist:
-                sublists.append(sublist)
-                sublist = []
+            sublists.append(sublist)
+            sublist = []
         else:
             sublist.append(element)
-    if sublist:
-        sublists.append(sublist)
+    sublists.append(sublist)
     return sublists
 
 class IdentityMap(nn.Module):
@@ -511,11 +511,8 @@ class Tokenizer:
                 return torch.tensor(input_ids, dtype=torch.long)
             raise ValueError(f'Unsupported tensor type: {return_tensors}')
         return input_ids
-    def encode(self,query: str, feats, stored=False):
-        # if stored:
+    def encode_text_old(self,query: str):
         #   feat: list of tuple(storage-id, block-size)
-        # else:
-        #   feat: np.array[nimage, 576, 4096]
         qs = query
         if IMAGE_PLACEHOLDER in qs:
             if self.mm_use_im_start_end:
@@ -532,36 +529,51 @@ class Tokenizer:
         conv.append_message(conv.roles[0], qs)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
+        # print(f'prompt {prompt}')
 
-        ids = self.tokenizer_image_token(prompt, IMAGE_TOKEN_INDEX)
-        if feats is not None:
-            idlst = split_list(ids, IMAGE_TOKEN_INDEX)
-            if _debug: print(f'idlst {idlst}')
-            if stored:
-                fullfeats = feats + [None]
-                ret = []
-                for iditem, t in zip(idlst, fullfeats):
-                    ret.extend(iditem)
-                    if t:
-                        storeid = t[0]
-                        blksz = t[1]
-                        d = [1 for _ in range(blksz)]
-                        d[0] = IMAGE_TOKEN_INDEX
-                        d[1] = storeid
-                        d[2] = blksz
-                        ret.extend(d)
-            else:
-                ret = []
-                ret.extend(idlst[0])
-                assert feats.shape[0] == len(idlst)-1
-                blksz = feats.shape[1]
-                d = [1 for i in range(blksz)]
+        return self.tokenizer_image_token(prompt, IMAGE_TOKEN_INDEX)
+    def encode_text(self,prompt: str):
+        return self.tokenizer_image_token(prompt, IMAGE_TOKEN_INDEX)
+    def encode_with_stored_feature(self,query: str, feats):
+        #   feat: list of tuple(storage-id, block-size)
+        assert feats is not None
+        ids = self.encode_text(query)
+        # print(f'ids {ids}')
+        # print(f'feats shape {feats.shape}')
+        idlst = split_list(ids, IMAGE_TOKEN_INDEX)
+        # print(f'id lst len {len(idlst)}: {idlst}')
+        if _debug: print(f'idlst {idlst}')
+        fullfeats = feats + [None]
+        ret = []
+        for iditem, t in zip(idlst, fullfeats):
+            ret.extend(iditem)
+            if t:
+                storeid = t[0]
+                blksz = t[1]
+                d = [1 for _ in range(blksz)]
                 d[0] = IMAGE_TOKEN_INDEX
-                for iditem in idlst[1:]:
-                    ret.extend(d)
-                    ret.extend(iditem)
-        else:
-            ret = ids
+                d[1] = storeid
+                d[2] = blksz
+                ret.extend(d)
+            
+        if _debug: print(f'type ret {type(ret)}: {ret}')
+        return ret
+    def encode_with_delay_feature(self,query: str, nimg, featsize):
+        #   feat: np.array[nimage, 576, 4096]
+        ids = self.encode_text(query)
+        # print(f'ids {ids}')
+
+        idlst = split_list(ids, IMAGE_TOKEN_INDEX)
+        # print(f'id lst len {len(idlst)}: {idlst}')
+        if _debug: print(f'idlst {idlst}')
+        ret = []
+        ret.extend(idlst[0])
+        assert nimg == len(idlst)-1
+        d = [1 for _ in range(featsize)]
+        d[0] = IMAGE_TOKEN_INDEX
+        for iditem in idlst[1:]:
+            ret.extend(d)
+            ret.extend(iditem)
             
         if _debug: print(f'type ret {type(ret)}: {ret}')
         return ret
@@ -575,7 +587,7 @@ class Tokenizer:
         return s
 
 class CLIPVisionTower(nn.Module):
-    def __init__(self, llava_model_path: str, mm_weight_path, device, vision_tower_path = None):
+    def __init__(self, llava_model_path: str,  device,mm_weight_path = None, vision_tower_path = None):
         super().__init__()
 
         with open(pathlib.Path(llava_model_path)/'config.json', 'r') as fp:
@@ -590,23 +602,33 @@ class CLIPVisionTower(nn.Module):
         self.vision_tower = CLIPVisionModel.from_pretrained(vision_tower_path)
 
         self.mm_projector = build_vision_projector(self.llava_config)
-        params = self.mm_projector.named_parameters()
-        prefix = 'model.mm_projector.'
-        if _debug: print(f"mm proj params:")
-        keys = []
-        for name, _ in params:
-            if _debug: print('\t', name)
-            keys.append(name)
-        if _debug: print('keys', keys)
-        # see llava_arch.py
-        with open(mm_weight_path, 'r') as fp:
+
+        if mm_weight_path is None:
+            # mm projector weight is extracted from llava weights and 
+            # saved in engine-dir/model/mm_projector.bin in model building
+            # see build_model.py
+            mm_weight_path = os.path.join(llava_model_path, 'mm_projector.bin')
+            assert os.path.exists(mm_weight_path)
+            w = torch.load(mm_weight_path)
+        else:
+            # in old days, projector weight stays inside llava model weights bin files
+            # so the original model is required for mm projector loading
+            params = self.mm_projector.named_parameters()
+            prefix = 'model.mm_projector.'
+            if _debug: print(f"mm proj params:")
+            keys = []
+            for name, _ in params:
+                if _debug: print('\t', name)
+                keys.append(name)
+            if _debug: print('keys', keys)
+            # see llava_arch.py
             w = torch.load(mm_weight_path)
             if _debug: print(f'type weight: {type(w)}')
             w = {k: w[prefix+k] for k in keys}
             if _debug:
                 for k in w.keys():
                     print('\t', k)
-            self.mm_projector.load_state_dict(w)
+        self.mm_projector.load_state_dict(w)
 
         self.to(device, dtype=torch.float16)
         self.requires_grad_(False)
@@ -641,14 +663,20 @@ class CLIPVisionTower(nn.Module):
             new_images = torch.stack(new_images, dim=0)
         return new_images
 
-    def load_image(self, image_file):
+    def load_image(self, image_file: str):
         if image_file.startswith("http") or image_file.startswith("https"):
             response = requests.get(image_file)
             image = Image.open(BytesIO(response.content)).convert("RGB")
-        elif pathlib.Path(image_file).exists():
+        elif len(image_file) < 1024 and pathlib.Path(image_file).exists():
             image = Image.open(image_file).convert("RGB")
         else:
             # treat as base64
+            if image_file.startswith("data:image"):
+                sub = "base64,"
+                idx = image_file.find(sub)
+                if idx < 0:
+                    raise RuntimeError("expect 'data:image/xxx;base64,' for image but not found")
+                image_file = image_file[idx + len(sub):].strip()
             image = self.load_image_from_base64(image_file)
         return image
 
@@ -847,7 +875,7 @@ class CLIPVisionTower(nn.Module):
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
-def decode_image(vt, images, store = False):
+def decode_image(vt: CLIPVisionTower, images, store = False):
     feats = vt.encode_images(images).to(torch.device("cpu")).numpy()
     if _debug: print(f"feat shape {feats.shape}")
     if store:
@@ -891,9 +919,7 @@ def create_request1(tk: Tokenizer, vt, query, images, pad_id):
     )
 
     return start_ids, start_lengths
-def create_request_noimg(tk: Tokenizer, query, pad_id):
-    start_ids = [ np.array(tk.encode(s[0].decode(), None)).astype(int) for s in query ]
-    # start_ids = [s[:10] for s in start_ids]
+def input_id_postprocess(start_ids, pad_id):
     if _debug: print(f"start ids {start_ids} @ {os.getpid()}")
     start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
 
@@ -914,10 +940,47 @@ def create_request_noimg(tk: Tokenizer, query, pad_id):
 
     return start_ids, start_lengths
 
-def create_request(tk: Tokenizer, vt, query, images, pad_id):
+def create_request_noimg(tk: Tokenizer, query, pad_id):
+    start_ids = [ np.array(tk.encode_text(s[0].decode())).astype(int) for s in query ]
+    return input_id_postprocess(start_ids, pad_id)
+
+# create request with vison tower
+def create_request_vision_tower(tk: Tokenizer, vt, query, images, pad_id):
     """
     query : batch string (2D numpy array)
     images: 3D numpy array, [batch, nimg, img]
+    """
+    assert images is not None
+    if _debug: print(f"query: {query}")  # like [[b'hello']]
+    if _debug: print(f"images: {images}")  # like [[b'hello']]
+    if _debug: 
+        if hasattr(query, "shape") and hasattr(images, "shape"):
+            print(f"shape of query {query.shape} images {images.shape}")
+    # images [batch, [image list]] -> [[image1, image2, ...], [...]]
+    images = [[s.decode() for s in batch] for batch in images]
+    feats = [decode_image(vt,img) for img in images] # [batch, np.array(nimage, 576, 4096)]
+    if _debug: print(f'feats len {len(feats)} shape {feats[0].shape}')
+    start_ids = [
+        np.array(tk.encode_with_delay_feature(s[0].decode(), feat.shape[0], feat.shape[1])).astype(int)
+        for s, feat in zip(query, feats)
+    ]
+
+    return *input_id_postprocess(start_ids, pad_id), feats
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+executor = ThreadPoolExecutor(max_workers=5)
+def send_request(req):
+    s = requests.Session()
+    pr = s.prepare_request(req)
+    return s.send(pr, timeout=10)
+
+# create request with vega
+def create_request_vega(tk: Tokenizer,  query, images, pad_id, hidden, vega_url):
+    """
+    query : batch string (2D numpy array)
+    images: 3D numpy array, [batch, nimg, img]
+
+    return: start ids/length [batch, ids], feat [batch, [list of path]]
     """
     if images is None:
         ret = create_request_noimg(tk, query, pad_id)
@@ -929,49 +992,67 @@ def create_request(tk: Tokenizer, vt, query, images, pad_id):
             print(f"shape of query {query.shape} images {images.shape}")
     # images [batch, [image list]] -> [[image1, image2, ...], [...]]
     images = [[s.decode() for s in batch] for batch in images]
-    feats = [decode_image(vt,img) for img in images] # [batch, nimage, 576, 4096]
-    if _debug: print(f'feats len {len(feats)} shape {feats[0].shape}')
+    url = 'http://' + vega_url + '/infer'
+    eles = [element for batch in images for element in batch]
+    def parse(rsp):
+        if rsp is None or rsp.status_code != 200:
+            print(f'rsp code {rsp.status_code}')
+            raise Exception("vega inference failed: response is not 200")
+        js = json.loads(rsp.content)
+        if 'feat' in js and 'size'  in js:
+            return js['feat'], js['size']
+        print(f"not found: {rsp.content}")
+        raise Exception("feat or size not found in vega response")
+    
+    start = time.time()
+    reqs = [requests.Request(method="POST", url=url, json={'image': img}, headers={'Content-Type': 'application/json'}) for img in eles]
+    futures = [executor.submit(send_request, req) for req in reqs]
+    results = [parse(future.result()) for future in as_completed(futures)]
+    end = time.time()
+    print(f"vega proc takes {int(1000*(end-start))}ms")
+    featsz = results[0][1] // hidden
+    results = [bytes(f'{featsz}:{r[0]}', encoding='utf-8') for r in results] # remove elesize(which is fixed) -> "feature size : list of feat file path"
+    composed = [] # list of sublist(tuple(path, elesize))
+    for batch in images:
+        composed.append(np.array(results[:len(batch)]))
+        results = results[len(batch):]
     start_ids = [
-        np.array(tk.encode(s[0].decode(), feat)).astype(int)
-        for s, feat in zip(query, feats)
+        np.array(tk.encode_with_delay_feature(s[0].decode(), len(paths), featsz)).astype(int)
+        for s, paths in zip(query, composed)
     ]
-    # start_ids = [s[:10] for s in start_ids]
-    if _debug: print(f"start ids {start_ids} @ {os.getpid()}")
-    start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
+    return *input_id_postprocess(start_ids, pad_id), np.array(composed)
 
-    max_len = 0
-    for seq in start_ids:
-        max_len = max(max_len, seq.shape[0])
-    start_ids = np.stack(
-        [
-            np.pad(
-                seq,
-                (0, max_len - seq.shape[0]),
-                "constant",
-                constant_values=(0, pad_id),
-            )
-            for seq in start_ids
-        ]
-    )
+def create_request_feat(tk: Tokenizer,  query, features, featsize, pad_id, hidden):
+    """
+    query : batch string (2D numpy array)
+    images: 3D numpy array, [batch, nimg, img]
 
-    return start_ids, start_lengths, feats
+    return: start ids/length [batch, ids], feat [batch, [list of path]]
+    """
+    assert features is not None
+    featsz = featsize // hidden
+    results = [np.array([bytes(f'{featsz}:{r.decode()}', encoding='utf-8') for r in sub]) for sub in features]
+    start_ids = [
+        np.array(tk.encode_with_delay_feature(s[0].decode(), len(paths), featsz)).astype(int)
+        for s, paths in zip(query, results)
+    ]
+    return *input_id_postprocess(start_ids, pad_id), np.array(results)
+
 if __name__ == "__main__":
     _debug = True
     dgtrt.enable_request_storage()
-    llava='/data/jgq/tmpfs/llava-v1.5-7b'
-    mmw = llava+'/pytorch_model-00002-of-00002.bin'
-    device=torch.device('cuda:2')
+    llava='/data/jgq/tmpfs/llava-v1.5-13b-engine1/model'
+    device=torch.device('cuda:4')
     cpu = torch.device('cpu')
-    vt = CLIPVisionTower(llava, mmw, device)
     tk = Tokenizer(llava)
+    
     pad_id = tk.tokenizer.encode(
         tk.tokenizer.pad_token, add_special_tokens=False
     )[0]
-    prompt = [[b"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER:What did you see in this image? and how are you feeling?<image-placeholder> ASSISTANT:"]]
-    image_file = [[b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg"]]
-    ids, lens, feats = create_request(tk, vt, prompt, image_file, pad_id)
-    print(ids)
-    print(lens)
-    print(feats)
-    print(type(feats))
-    print(feats.shape)
+    vt = CLIPVisionTower(llava, device)
+    prompt = [[b"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER:What did you see in this image? and how are you feeling?<image-placeholder><image-placeholder> ASSISTANT:"]]
+    image_file = [[b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg", b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg"]]
+    ids, lens, feats = create_request_vision_tower(tk,  vt, prompt, image_file, pad_id)
+    print('ids ', ids)
+    print('lens ', lens)
+    print('feats ', feats)

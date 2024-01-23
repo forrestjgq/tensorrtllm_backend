@@ -9,7 +9,7 @@ input [
   },
   {
     name: "max_tokens"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ -1 ]
   },
   {
@@ -24,19 +24,19 @@ input [
   },
   {
     name: "end_id"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
   },
   {
     name: "pad_id"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
   },
   {
     name: "top_k"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
   },
@@ -66,12 +66,18 @@ input [
   },
   {
     name: "min_length"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
   },
   {
     name: "presence_penalty"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "frequency_penalty"
     data_type: TYPE_FP32
     dims: [ 1 ]
     optional: true
@@ -84,7 +90,7 @@ input [
   },
   {
     name: "beam_width"
-    data_type: TYPE_UINT32
+    data_type: TYPE_INT32
     dims: [ 1 ]
     optional: true
   },
@@ -186,6 +192,10 @@ ensemble_scheduling {
       input_map {
           key: "presence_penalty"
           value: "presence_penalty"
+      }
+      input_map {
+          key: "frequency_penalty"
+          value: "frequency_penalty"
       }
       input_map {
           key: "random_seed"

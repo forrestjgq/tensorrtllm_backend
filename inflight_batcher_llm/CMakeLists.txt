@@ -1,4 +1,4 @@
-# Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met: *
@@ -28,21 +28,9 @@ set(TRITON_BUILD
     OFF
     CACHE STRING "Using Triton build process")
 
-if(TRITON_BUILD)
-  set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm)
-  # Install build time dependencies. This section is executed during cmake
-  # configure time.
-  execute_process(
-    COMMAND bash -x ./tools/environment_setup.sh
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    RESULT_VARIABLE CMD_RESULT)
-  if(NOT CMD_RESULT EQUAL "0")
-    message(FATAL_ERROR "Failed to install build time dependencies")
-  endif()
-else()
-  set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
-endif()
+set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
 
+message("TRTLLM DIR ${TRTLLM_DIR}")
 include(${TRTLLM_DIR}/cpp/cmake/modules/find_library_create_target.cmake)
 
 project(tritontensorrtllmbackend LANGUAGES C CXX)
@@ -57,15 +45,11 @@ project(tritontensorrtllmbackend LANGUAGES C CXX)
 # related features since TRT-LLM backend manages the usage on GPUs itself.
 option(TRITON_ENABLE_GPU "Enable GPU support in backend" OFF)
 option(TRITON_ENABLE_STATS "Include statistics collections in backend" ON)
+option(TRITON_ENABLE_METRICS "Include metrics support in server" ON)
 
-# The TRTLLM_BUILD_CONTAINER is used to compile the TRT-LLM libraries that are
-# needed for the TRT-LLM backend. The TRTLLM_BUILD_CONTAINER is launched
-# separately, and the artifacts will be copied back to the backend installation
-# directory.
-if(TRITON_BUILD)
-  set(TRTLLM_BUILD_CONTAINER
-      ""
-      CACHE STRING "Base image for building TRT-LLM")
+if(TRITON_ENABLE_METRICS AND NOT TRITON_ENABLE_STATS)
+  message(
+    FATAL_ERROR "TRITON_ENABLE_METRICS=ON requires TRITON_ENABLE_STATS=ON")
 endif()
 
 set(TRITON_COMMON_REPO_TAG
@@ -110,43 +94,17 @@ FetchContent_Declare(
   GIT_SHALLOW ON)
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
 
-# Compile TRT-LLM
-if(TRITON_BUILD)
-  set(TRITON_TRTLLM_DOCKER_NAME "tritonserver-trtllm")
-  add_custom_command(
-    OUTPUT tensorrt_llm_build
-    COMMENT "Building TensorRT-LLM"
-    COMMAND
-      cd ${CMAKE_CURRENT_SOURCE_DIR} && python3 tools/gen_trtllm_dockerfile.py
-      --trtllm-build-config="${CMAKE_BUILD_TYPE}"
-      --trtllm-base-image="${TRTLLM_BUILD_CONTAINER}" --output=Dockerfile.trtllm
-    COMMAND
-      cd ${CMAKE_CURRENT_SOURCE_DIR} && docker build
-      --cache-from=${TRITON_TRTLLM_DOCKER_NAME}
-      --cache-from=${TRITON_TRTLLM_DOCKER_NAME}_cache0
-      --cache-from=${TRITON_TRTLLM_DOCKER_NAME}_cache1 -t
-      ${TRITON_TRTLLM_DOCKER_NAME} -f ./Dockerfile.trtllm .
-    COMMAND docker rm trtllm_build || echo 'error ignored...' || true
-    COMMAND docker create --name trtllm_build ${TRITON_TRTLLM_DOCKER_NAME}
-    COMMAND cd ${CMAKE_CURRENT_SOURCE_DIR} && rm -fr tensorrt_llm
-    COMMAND cd ${CMAKE_CURRENT_SOURCE_DIR} && docker cp
-            trtllm_build:/app/tensorrt_llm tensorrt_llm
-    COMMAND docker cp trtllm_build:/opt/trtllm_lib trtllm_build
-    COMMAND docker rm trtllm_build)
-endif()
-
 #
 # The backend must be built into a shared library. Use an ldscript to hide all
 # symbols except for the TRITONBACKEND API.
 #
 configure_file(src/libtriton_tensorrtllm.ldscript
                libtriton_tensorrtllm.ldscript COPYONLY)
-add_library(triton-tensorrt-llm-backend SHARED src/libtensorrtllm.cc)
 
-if(TRITON_BUILD)
-  add_custom_target(trtllm_target DEPENDS tensorrt_llm_build)
-  add_dependencies(triton-tensorrt-llm-backend trtllm_target)
-endif()
+set(SRCS src/libtensorrtllm.cc src/work_item.cc src/work_items_queue.cc
+         src/model_instance_state.cc src/model_state.cc src/utils.cc)
+
+add_library(triton-tensorrt-llm-backend SHARED ${SRCS})
 
 add_library(TritonTensorRTLLMBackend::triton-tensorrt-llm-backend ALIAS
             triton-tensorrt-llm-backend)
@@ -245,6 +203,7 @@ target_compile_options(
     -Wall
     -Wextra
     -Wno-unused-parameter
+    -Wno-deprecated-declarations
     -Wno-type-limits>
     $<$<CXX_COMPILER_ID:MSVC>:/Wall
     /D_WIN32_WINNT=0x0A00
@@ -322,11 +281,65 @@ set_property(
     "${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so"
 )
 
-if(TRITON_BUILD)
-  add_dependencies(tensorrt_llm trtllm_target)
-  add_dependencies(tensorrt_llm_batch_manager trtllm_target)
-  add_dependencies(nvinfer_plugin_tensorrt_llm trtllm_target)
+if(TRITON_ENABLE_METRICS)
+  message("Compiling statistics reporter...")
+  list(APPEND REPORTER_SRCS
+       src/custom_metrics_reporter/custom_metrics_reporter.cc)
+  list(APPEND REPORTER_HDRS
+       src/custom_metrics_reporter/custom_metrics_reporter.h)
+
+  add_library(triton-custom-metrics-reporter-library EXCLUDE_FROM_ALL
+              ${REPORTER_SRCS} ${REPORTER_HDRS})
+  target_compile_features(triton-custom-metrics-reporter-library
+                          PRIVATE cxx_std_17)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(triton-custom-metrics-reporter-library
+                           PRIVATE /W1 /D_WIN32_WINNT=0x0A00 /EHsc)
+  else()
+    target_compile_options(
+      triton-custom-metrics-reporter-library
+      PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
+              -Werror)
+  endif()
+
+  set_target_properties(triton-custom-metrics-reporter-library
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  target_link_libraries(
+    triton-custom-metrics-reporter-library
+    PUBLIC triton-common-json # from repo-common
+           triton-common-logging # from repo-common
+           triton-core-serverapi # from repo-core
+           triton-core-serverstub # from repo-core
+           triton-backend-utils # from repo-backend
+           tensorrt_llm_batch_manager)
+
+  target_compile_definitions(triton-tensorrt-llm-backend
+                             PRIVATE TRITON_ENABLE_METRICS=1)
+  target_link_libraries(triton-tensorrt-llm-backend
+                        PRIVATE triton-custom-metrics-reporter-library)
 endif()
+
+if(TRITON_BUILD)
+
+  if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    execute_process(
+      WORKING_DIRECTORY ${TRTLLM_DIR}
+      COMMAND bash -x docker/common/install_pytorch.sh pypi COMMAND_ECHO STDOUT
+              COMMAND_ERROR_IS_FATAL ANY)
+  else()
+    execute_process(
+      WORKING_DIRECTORY ${TRTLLM_DIR}
+      COMMAND bash -x docker/common/install_pytorch.sh src_non_cxx11_abi
+              COMMAND_ECHO STDOUT COMMAND_ERROR_IS_FATAL ANY)
+  endif() # CMAKE_HOST_SYSTEM_PROCESSOR
+
+  execute_process(
+    WORKING_DIRECTORY ${TRTLLM_DIR}
+    COMMAND python3 scripts/build_wheel.py --trt_root /usr/local/tensorrt
+            COMMAND_ECHO STDOUT COMMAND_ERROR_IS_FATAL ANY)
+
+endif() # TRITON_BUILD
 
 target_link_libraries(
   triton-tensorrt-llm-backend
@@ -379,9 +392,14 @@ install(
   RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/tensorrtllm)
 
 if(TRITON_BUILD)
-  install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/trtllm_build/
+  file(
+    GLOB
+    LIBINFER_PLUGIN_TENSORRT_LLM
+    "${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so*"
+    FOLLOW_SYMLINKS)
+  install(FILES ${LIBINFER_PLUGIN_TENSORRT_LLM}
           DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/tensorrtllm)
-endif()
+endif() # TRITON_BUILD
 
 install(
   EXPORT triton-tensorrt-llm-backend-targets
