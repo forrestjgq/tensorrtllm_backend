@@ -67,8 +67,8 @@ class TritonPythonModel:
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
                                          padding_side='left')
         elif tokenizer_type == 'auto':
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_dir, padding_side='left', trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                                           padding_side='left')
         elif tokenizer_type == 'chatglm':
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir,
                                                            trust_remote_code=True)
@@ -92,6 +92,13 @@ class TritonPythonModel:
         # Convert Triton types to numpy types
         self.output_dtype = pb_utils.triton_string_to_numpy(
             output_config['data_type'])
+
+        tokens_config = pb_utils.get_output_config_by_name(
+            model_config, "TOKENS")
+
+        # Convert Triton types to numpy types
+        self.tokens_dtype = pb_utils.triton_string_to_numpy(
+            tokens_config['data_type'])
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -147,7 +154,7 @@ class TritonPythonModel:
             # tokens_batch = tokens_batch.T
 
             # Postprocessing output data.
-            outputs = self._postprocessing(tokens_batch, sequence_lengths)
+            outputs,tokens = self._postprocessing(tokens_batch, sequence_lengths)
 
             # Create output tensors. You need pb_utils.Tensor
             # objects to create pb_utils.InferenceResponse.
@@ -166,6 +173,11 @@ class TritonPythonModel:
 
             out_generation_logits = pb_utils.Tensor('OUT_GENERATION_LOGITS',
                                                     generation_logits)
+													
+            tokens_tensor = pb_utils.Tensor(
+                'TOKENS',
+                np.array(tokens).astype(self.tokens_dtype))
+													
 
             # Create InferenceResponse. You can set an error here in case
             # there was a problem with handling this inference request.
@@ -176,7 +188,7 @@ class TritonPythonModel:
             #    output_tensors=..., TritonError("An error occurred"))
             inference_response = pb_utils.InferenceResponse(output_tensors=[
                 output_tensor, out_cum_log_probs, out_output_log_probs,
-                out_context_logits, out_generation_logits
+                out_context_logits, out_generation_logits, tokens_tensor
             ])
             responses.append(inference_response)
 
@@ -193,6 +205,7 @@ class TritonPythonModel:
 
     def _postprocessing(self, tokens_batch, sequence_lengths):
         outputs = []
+        output_tokens = []
         for batch_idx, beam_tokens in enumerate(tokens_batch):
             for beam_idx, tokens in enumerate(beam_tokens):
                 seq_len = sequence_lengths[batch_idx][beam_idx]
@@ -200,4 +213,5 @@ class TritonPythonModel:
                     tokens[:seq_len],
                     skip_special_tokens=self.skip_special_tokens)
                 outputs.append(output.encode('utf8'))
-        return outputs
+                output_tokens.append(seq_len)
+        return outputs, output_tokens
