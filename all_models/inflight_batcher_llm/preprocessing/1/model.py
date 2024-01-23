@@ -30,8 +30,8 @@ from typing import List
 import os
 import numpy as np
 import triton_python_backend_utils as pb_utils
-from clip_encoder import Tokenizer, CLIPVisionTower, create_request_vega, create_request_vision_tower, create_request_noimg, create_request_feat
-import torch
+from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
+from clip_encoder import Tokenizer, CLIPVisionTower, create_request_vision_tower, create_request_noimg, create_request_feat
 
 
 class TritonPythonModel:
@@ -61,6 +61,7 @@ class TritonPythonModel:
         self.schema = params["schema"]["string_value"]
         self.hidden_size = int(params["hidden_size"]["string_value"])
         self.max_input_length = int(params["max_input_len"]["string_value"])
+        self.model_name = params["model_name"]["string_value"]
 		
         tokenizer_dir = model_config['parameters']['tokenizer_dir'][
             'string_value']
@@ -72,7 +73,16 @@ class TritonPythonModel:
                 'true', '1', 't', 'y', 'yes'
             ]
 
-        if tokenizer_type == 't5':
+        if 'llava' in self.model_name.lower():
+            # llava start
+            self.llava = tokenizer_dir
+            self.vt = None # vision tower
+            if self.schema == "vision_tower":
+                sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
+                self.vt = CLIPVisionTower(self.llava, sdevice)
+            self.tk = Tokenizer(self.llava)
+            self.tokenizer = self.tk.tokenizer
+        elif tokenizer_type == 't5':
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
                                          padding_side='left')
         elif tokenizer_type == 'chatglm':
@@ -126,31 +136,6 @@ class TritonPythonModel:
                     pb_utils.get_output_config_by_name(
                         model_config, output_name)['data_type']))
 
-        # llava start
-        self.llava = tokenizer_dir
-            
-        if self.schema == "vision_tower":
-            sdevice = f"cuda:{args.get('model_instance_device_id', '0')}"
-            if False:
-                # in old days, projector weight stays inside llava model weights bin files
-                # so the original model is required for mm projector loading
-                with open(os.path.join(self.llava, "pytorch_model.bin.index.json"), 'r') as fp:
-                    js = json.load(fp)
-                    wmap = js["weight_map"]
-                    bins = {v for k, v in wmap.items() if k.startswith("model.mm_projector")}
-                    assert len(bins) == 1
-                    mmw = os.path.join(self.llava, bins.pop())
-                    print(f"loading vision tower to device {sdevice}")
-                    self.vt = CLIPVisionTower(self.llava,  torch.device(sdevice), mm_weight_path=mmw)
-            else:
-                self.vt = CLIPVisionTower(self.llava, torch.device(sdevice))
-        elif self.schema == 'input_feature':
-            self.vt = None
-        self.tk = Tokenizer(self.llava)
-        self.tk.tokenizer.pad_token = self.tk.tokenizer.eos_token
-        self.pad_id = self.tk.tokenizer.encode(
-            self.tk.tokenizer.pad_token, add_special_tokens=False
-        )[0]
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -195,11 +180,17 @@ class TritonPythonModel:
             request_output_len = pb_utils.get_input_tensor_by_name(
                 request, 'REQUEST_OUTPUT_LEN').as_numpy()
 
+            # multimodel processing
+            images = None
+            feat_size = None
+            
             # llava
-            images = pb_utils.get_input_tensor_by_name(request, "IMAGES")
+            if 'llava' in self.model_name.lower():
+                images = pb_utils.get_input_tensor_by_name(request, "IMAGES")
+                feat_size = pb_utils.get_input_tensor_by_name(request, "FEATURE_SIZE")
+
             if images is not None:
                 images = images.as_numpy()
-            feat_size = pb_utils.get_input_tensor_by_name(request, "FEATURE_SIZE")
             if feat_size is not None:
                 feat_size = feat_size.as_numpy()
 
@@ -240,28 +231,30 @@ class TritonPythonModel:
                 pad_id = [[self.tokenizer_pad_id]]
 
             # Preprocessing input data.
-            input_id, request_input_len = self._create_request(query)
-            #llava
-            feats = None
-            feat_path = None
-            if images is not None:
-                if self.schema == 'input_feature':
-                    # input feature requires feature size and feature file path, 
-                    # feature size is used to insert placeholders into input-ids
-                    # feature file will be loaded inside trtllm backend and saved
-                    # for lookup-plugin
-                    assert feat_size is not None
-                    input_id, request_input_len, feat_path = create_request_feat(self.tk, query, images, feat_size[0][0], self.pad_id, self.hidden_size)
-                elif self.schema == 'vision_tower':
-                    assert self.vt is not None
-                    input_id, request_input_len, feats = create_request_vision_tower(self.tk, self.vt, query, images, self.pad_id)
-                    feats = np.array(feats, dtype=self.image_feature_dtype)
+            if 'llava' in self.model_name.lower():
+                #llava
+                feats = None # deliver feature data to next model
+                feat_path = None # save feature to a file and deliver file path to next model
+                if images is not None:
+                    if self.schema == 'input_feature':
+                        # input feature requires feature size and feature file path, 
+                        # feature size is used to insert placeholders into input-ids
+                        # feature file will be loaded inside trtllm backend and saved
+                        # for lookup-plugin
+                        assert feat_size is not None
+                        input_id, request_input_len, feat_path = create_request_feat(self.tk, query, images, feat_size[0][0], self.tokenizer_pad_id, self.hidden_size)
+                    elif self.schema == 'vision_tower':
+                        assert self.vt is not None
+                        input_id, request_input_len, feats = create_request_vision_tower(self.tk, self.vt, query, images, self.tokenizer_pad_id)
+                        feats = np.array(feats, dtype=self.image_feature_dtype)
+                    else:
+                        raise Exception(f'unknown schema {self.schema}') 
                 else:
-                    raise Exception(f'unknown schema {self.schema}') 
+                    input_id, request_input_len = create_request_noimg(self.tk, query, self.tokenizer_pad_id)
             else:
-                input_id, request_input_len = create_request_noimg(self.tk, query, self.pad_id)
+                input_id, request_input_len = self._create_request(query)
             
-            # check input size
+            # jgq: check input size, request will fail if it exceeds max input length
             if any(request_input_len > self.max_input_length):
                 err_str = (f"input token size {request_input_len} exceeds max input length {self.max_input_length}")
                 logger.log_error(err_str)
