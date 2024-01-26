@@ -201,6 +201,8 @@ ModelInstanceState::ModelInstanceState(ModelState* model_state, TRITONBACKEND_Mo
         // If parameter is not specified, just ignore
         TLLM_LOG_WARNING("exclude_input_in_output is not specified, will be set to false");
     }
+    mExcludeInputInOutput = excludeInputInOutput;
+
 
     std::optional<int32_t> maxAttentionWindow = std::nullopt;
     try
@@ -510,7 +512,61 @@ TRITONSERVER_Error* ModelInstanceState::sendTritonResponse(std::shared_ptr<WorkI
     }
     else
     {
-        for (auto it = response_tensors.begin(); it != response_tensors.end(); ++it)
+        // to avoid segment falut like https://github.com/NVIDIA/TensorRT-LLM/issues/782
+        auto mut_response_tensors = response_tensors;
+        if (!mExcludeInputInOutput && !workItem->getInferenceRequest()->isStreaming())
+        {
+            const auto input_lengths = workItem->getInferenceRequest()->getInputTensor("input_lengths");
+            const auto input_lengths_data = reinterpret_cast<int32_t*>(input_lengths->data());
+            const auto input_lengths_data_end = input_lengths_data + input_lengths->getSize();
+            const auto min_input_length = std::min_element(input_lengths_data, input_lengths_data_end);
+            TLLM_CHECK(min_input_length != input_lengths_data_end);
+            for (auto it = mut_response_tensors.begin(); it != mut_response_tensors.end(); ++it)
+            {
+                if (it->name == "output_ids" && workItem->hasOutputName("output_ids"))
+                {
+                    const auto old_shape = it->tensor->getShape();
+                    auto new_shape = old_shape;
+                    new_shape.d[2] -= *min_input_length;
+
+                    const auto dtype_size = BufferDataType(it->tensor->getDataType()).getSize();
+                    BufferManager::ITensorPtr t = BufferManager::cpu(new_shape, it->tensor->getDataType());
+                    memset(t->data(), 0, t->getSizeInBytes());
+                    for (int32_t batch_idx = 0; batch_idx < old_shape.d[0]; ++batch_idx)
+                    {
+                        TLLM_CHECK(input_lengths_data[batch_idx] + new_shape.d[2] <= old_shape.d[2]);
+                        const auto old_batch_offset = batch_idx * old_shape.d[1] * old_shape.d[2];
+                        const auto new_batch_offset = batch_idx * new_shape.d[1] * new_shape.d[2];
+                        for (int32_t beam = 0; beam < old_shape.d[1]; ++beam)
+                        {
+                            std::memcpy(t->data(new_batch_offset + beam * new_shape.d[2]),
+                                it->tensor->data(
+                                    old_batch_offset + beam * old_shape.d[2] + input_lengths_data[batch_idx]),
+                                new_shape.d[2] * dtype_size);
+                        }
+                    }
+                    it->tensor = std::move(t);
+                }
+                else if (it->name == "sequence_length" && workItem->hasOutputName("sequence_length"))
+                {
+                    const auto t_shape = it->tensor->getShape();
+                    BufferManager::ITensorPtr t = BufferManager::cpu(t_shape, it->tensor->getDataType());
+                    for (int32_t batch_idx = 0; batch_idx < t_shape.d[0]; ++batch_idx)
+                    {
+                        const auto batch_offset = batch_idx * t_shape.d[1];
+                        for (int32_t beam = 0; beam < t_shape.d[1]; ++beam)
+                        {
+                            const auto idx = batch_offset + beam;
+                            *reinterpret_cast<int32_t*>(t->data(idx))
+                                = *reinterpret_cast<int32_t*>(it->tensor->data(idx))
+                                - input_lengths_data[batch_idx];
+                        }
+                    }
+                    it->tensor = std::move(t);
+                }
+            }
+        }
+        for (auto it = mut_response_tensors.begin(); it != mut_response_tensors.end(); ++it)
         {
             auto tensor = *it;
             if (!workItem->hasOutputName(tensor.name))

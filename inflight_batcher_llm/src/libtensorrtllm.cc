@@ -48,6 +48,10 @@
 #include "custom_metrics_reporter/custom_metrics_reporter.h"
 #endif
 
+#ifdef USE_DGTRT
+#include "storage.h"
+#endif
+
 namespace triton::backend::inflight_batcher_llm
 {
 
@@ -113,7 +117,9 @@ extern "C"
         ModelInstanceState* instance_state;
         RETURN_IF_ERROR(ModelInstanceState::Create(model_state, instance, &instance_state));
         RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceSetState(instance, reinterpret_cast<void*>(instance_state)));
-
+#ifdef USE_DGTRT
+        dg::enable_request_storage();
+#endif
         return nullptr; // success
     }
 

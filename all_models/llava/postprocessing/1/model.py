@@ -1,4 +1,4 @@
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -57,11 +57,6 @@ class TritonPythonModel:
             'string_value']
         tokenizer_type = model_config['parameters']['tokenizer_type'][
             'string_value']
-        self.skip_special_tokens = model_config['parameters'].get(
-            'skip_special_tokens',
-            {'string_value': "true"})['string_value'].lower() in [
-                'true', '1', 't', 'y', 'yes'
-            ]
 
         if tokenizer_type == 't5':
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
@@ -83,7 +78,10 @@ class TritonPythonModel:
             raise AttributeError(
                 f'Unexpected tokenizer type: {tokenizer_type}')
         if tokenizer_type != 'chatglm':
+            self.decode_args = {'skip_special_tokens': True}
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        else:
+            self.decode_args = {'skip_special_tokens': True}
 
         # Parse model output configs
         output_config = pb_utils.get_output_config_by_name(
@@ -133,22 +131,6 @@ class TritonPythonModel:
             sequence_lengths = pb_utils.get_input_tensor_by_name(
                 request, 'SEQUENCE_LENGTH').as_numpy()
 
-            # Get cum log probs
-            cum_log_probs = pb_utils.get_input_tensor_by_name(
-                request, 'CUM_LOG_PROBS').as_numpy()
-
-            # Get sequence length
-            output_log_probs = pb_utils.get_input_tensor_by_name(
-                request, 'OUTPUT_LOG_PROBS').as_numpy()
-
-            # Get context logits
-            context_logits = pb_utils.get_input_tensor_by_name(
-                request, 'CONTEXT_LOGITS').as_numpy()
-
-            # Get generation logits
-            generation_logits = pb_utils.get_input_tensor_by_name(
-                request, 'GENERATION_LOGITS').as_numpy()
-
             # Reshape Input
             # tokens_batch = tokens_batch.reshape([-1, tokens_batch.shape[0]])
             # tokens_batch = tokens_batch.T
@@ -161,23 +143,9 @@ class TritonPythonModel:
             output_tensor = pb_utils.Tensor(
                 'OUTPUT',
                 np.array(outputs).astype(self.output_dtype))
-
-            out_cum_log_probs = pb_utils.Tensor('OUT_CUM_LOG_PROBS',
-                                                cum_log_probs)
-
-            out_output_log_probs = pb_utils.Tensor('OUT_OUTPUT_LOG_PROBS',
-                                                   output_log_probs)
-
-            out_context_logits = pb_utils.Tensor('OUT_CONTEXT_LOGITS',
-                                                 context_logits)
-
-            out_generation_logits = pb_utils.Tensor('OUT_GENERATION_LOGITS',
-                                                    generation_logits)
-													
             tokens_tensor = pb_utils.Tensor(
                 'TOKENS',
                 np.array(tokens).astype(self.tokens_dtype))
-													
 
             # Create InferenceResponse. You can set an error here in case
             # there was a problem with handling this inference request.
@@ -186,10 +154,8 @@ class TritonPythonModel:
             #
             # pb_utils.InferenceResponse(
             #    output_tensors=..., TritonError("An error occurred"))
-            inference_response = pb_utils.InferenceResponse(output_tensors=[
-                output_tensor, out_cum_log_probs, out_output_log_probs,
-                out_context_logits, out_generation_logits, tokens_tensor
-            ])
+            inference_response = pb_utils.InferenceResponse(
+                output_tensors=[output_tensor, tokens_tensor])
             responses.append(inference_response)
 
         # You should return a list of pb_utils.InferenceResponse. Length
@@ -209,9 +175,7 @@ class TritonPythonModel:
         for batch_idx, beam_tokens in enumerate(tokens_batch):
             for beam_idx, tokens in enumerate(beam_tokens):
                 seq_len = sequence_lengths[batch_idx][beam_idx]
-                output = self.tokenizer.decode(
-                    tokens[:seq_len],
-                    skip_special_tokens=self.skip_special_tokens)
+                output = self.tokenizer.decode(tokens[:seq_len], **self.decode_args)
                 outputs.append(output.encode('utf8'))
                 output_tokens.append(seq_len)
         return outputs, output_tokens

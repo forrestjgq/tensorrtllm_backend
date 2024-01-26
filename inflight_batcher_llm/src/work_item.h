@@ -84,7 +84,8 @@ public:
 
 private:
     // Convert Trition request to trtllm InferenceRequest
-    static std::shared_ptr<InferenceRequest> createInferenceRequest(
+    // static // jgq remove static to enable mStorageIds
+    std::shared_ptr<InferenceRequest> createInferenceRequest(
         TRITONBACKEND_Request* request, uint64_t requestId, bool isDecoupled);
 
     void Initialize(TRITONBACKEND_Request* request, uint64_t requestId, bool isDecoupled);
@@ -96,6 +97,9 @@ private:
 
     Timestamps mTimestamps;
     TRITONBACKEND_Request* mTritonInferenceRequest;
+#ifdef USE_DGTRT
+    std::vector<int> mStorageIds;
+#endif
 };
 
 } // namespace triton::backend::inflight_batcher_llm
