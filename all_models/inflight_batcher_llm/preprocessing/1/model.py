@@ -231,32 +231,49 @@ class TritonPythonModel:
                 pad_id = [[self.tokenizer_pad_id]]
 
             # Preprocessing input data.
-            if 'llava' in self.model_name.lower():
-                #llava
-                feats = None # deliver feature data to next model
-                feat_path = None # save feature to a file and deliver file path to next model
+            feats = None  # deliver feature data to next model
+            feat_path = (
+                None  # save feature to a file and deliver file path to next model
+            )
+            if "llava" in self.model_name.lower():
+                # llava
                 if images is not None:
-                    if self.schema == 'input_feature':
-                        # input feature requires feature size and feature file path, 
+                    if self.schema == "input_feature":
+                        # input feature requires feature size and feature file path,
                         # feature size is used to insert placeholders into input-ids
                         # feature file will be loaded inside trtllm backend and saved
                         # for lookup-plugin
                         assert feat_size is not None
-                        input_id, request_input_len, feat_path = create_request_feat(self.tk, query, images, feat_size[0][0], self.tokenizer_pad_id, self.hidden_size)
-                    elif self.schema == 'vision_tower':
+                        input_id, request_input_len, feat_path = create_request_feat(
+                            self.tk,
+                            query,
+                            images,
+                            feat_size[0][0],
+                            self.tokenizer_pad_id,
+                            self.hidden_size,
+                        )
+                    elif self.schema == "vision_tower":
                         assert self.vt is not None
-                        input_id, request_input_len, feats = create_request_vision_tower(self.tk, self.vt, query, images, self.tokenizer_pad_id)
+                        (
+                            input_id,
+                            request_input_len,
+                            feats,
+                        ) = create_request_vision_tower(
+                            self.tk, self.vt, query, images, self.tokenizer_pad_id
+                        )
                         feats = np.array(feats, dtype=self.image_feature_dtype)
                     else:
-                        raise Exception(f'unknown schema {self.schema}') 
+                        raise Exception(f"unknown schema {self.schema}")
                 else:
-                    input_id, request_input_len = create_request_noimg(self.tk, query, self.tokenizer_pad_id)
+                    input_id, request_input_len = create_request_noimg(
+                        self.tk, query, self.tokenizer_pad_id
+                    )
             else:
                 input_id, request_input_len = self._create_request(query)
-            
+
             # jgq: check input size, request will fail if it exceeds max input length
             if any(request_input_len > self.max_input_length):
-                err_str = (f"input token size {request_input_len} exceeds max input length {self.max_input_length}")
+                err_str = f"input token size {request_input_len} exceeds max input length {self.max_input_length}"
                 logger.log_error(err_str)
                 responses.append(
                     pb_utils.InferenceResponse(
@@ -292,7 +309,9 @@ class TritonPythonModel:
 
 			# llava
             if feats is None:
-                feats = np.zeros((input_id.shape[0],1,1,1)).astype(self.image_feature_dtype)
+                feats = np.zeros((input_id.shape[0], 1, 1, 1)).astype(
+                    self.image_feature_dtype
+                )
             if feat_path is None:
                 feat_path = np.empty((input_id.shape[0], 1), self.feature_path_dtype)
             image_feat_tensor = pb_utils.Tensor( "IMAGE_FEATURE", feats)
