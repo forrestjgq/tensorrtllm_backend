@@ -33,7 +33,6 @@ import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 from clip_encoder import Tokenizer, CLIPVisionTower, create_request_vision_tower, create_request_noimg, create_request_feat
 
-
 class TritonPythonModel:
     """Your Python model must use the same class name. Every Python model
     that is created must have "TritonPythonModel" as the class name.
@@ -102,6 +101,7 @@ class TritonPythonModel:
             raise AttributeError(
                 f'Unexpected tokenizer type: {tokenizer_type}')
 
+        # print(f'tokenizer_type {tokenizer_type}')
         if tokenizer_type == 'chatglm':
             self.tokenizer_pad_id = self.tokenizer.pad_token_id
             self.tokenizer_end_id = self.tokenizer.eos_token_id
@@ -135,7 +135,6 @@ class TritonPythonModel:
                 pb_utils.triton_string_to_numpy(
                     pb_utils.get_output_config_by_name(
                         model_config, output_name)['data_type']))
-
 
     def execute(self, requests):
         """`execute` must be implemented in every Python model. `execute`
@@ -262,6 +261,7 @@ class TritonPythonModel:
                             self.tk, self.vt, query, images, self.tokenizer_pad_id
                         )
                         feats = np.array(feats, dtype=self.image_feature_dtype)
+                        # print(f'-->feats {feats} {feats.shape}')
                     else:
                         raise Exception(f"unknown schema {self.schema}")
                 else:
@@ -271,6 +271,7 @@ class TritonPythonModel:
             else:
                 input_id, request_input_len = self._create_request(query)
 
+            # print("input_id: ", input_id);
             # jgq: check input size, request will fail if it exceeds max input length
             if any(request_input_len > self.max_input_length):
                 err_str = f"input token size {request_input_len} exceeds max input length {self.max_input_length}"

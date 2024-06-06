@@ -21,6 +21,7 @@ import dgtrt
 import numpy as np
 import math
 import ast
+# from pynvml import *
 
 _debug = False
 
@@ -37,6 +38,15 @@ DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 IMAGE_PLACEHOLDER = "<image-placeholder>"
+
+
+# def mem_usage(str:str): 
+#     h = nvmlDeviceGetHandleByIndex(0)
+#     info = nvmlDeviceGetMemoryInfo(h)
+#     print(f'{str}')
+#     print(f'total    : {info.total/1024**2:.2f}')
+#     print(f'free     : {info.free / 1024**2:.2f}')
+#     print(f'used     : {info.used / 1024**2:.2f}')`
 
 def split_list(lst, value):
     sublists = []
@@ -588,6 +598,17 @@ conv_llava_v1_mmtag = Conversation(
     version="v1_mmtag",
 )
 
+conv_chatml_direct = Conversation(
+    system="""<|im_start|>system
+    Answer the questions.""",
+    roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+    version="mpt",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|im_end|>",
+)
+
 default_conversation = conv_vicuna_v1
 conv_templates = {
     "default": conv_vicuna_v0,
@@ -604,6 +625,7 @@ conv_templates = {
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
 
+    "chatml_direct": conv_chatml_direct,
     "mpt": conv_mpt,
 }
 
@@ -624,9 +646,16 @@ class Tokenizer:
             self.tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
 
         # todo: use model name to decide conversation mode
-        self.conv_mode = "llava_v1"
+        modeName = self.llava_config["_name_or_path"]
+        print(f'llava model: {modeName}')
+        if "yi" in modeName.lower():
+            self.conv_mode = "chatml_direct"
+        else:
+            self.conv_mode = "llava_v1"
+        print(f'conv_mode: {self.conv_mode}')
         self.image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         self.conv = conv_templates[self.conv_mode]
+        # nvmlInit() import pynvml
 
     def tokenizer_image_token(self, prompt, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
         prompt_chunks = [self.tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
@@ -744,9 +773,6 @@ class CLIPVisionTower(nn.Module):
         self.mm_projector = build_vision_projector(self.llava_config)
 
         if 'unpad' in self.mm_patch_merge_type:
-            # self.image_newline = nn.Parameter(
-            #     torch.empty(self.model_hidden_size, dtype=self.dtype)
-            # )
             embed_std = 1 / torch.sqrt(torch.tensor(self.model_hidden_size, dtype=self.dtype))
             self.image_newline = nn.Parameter(
                 torch.randn(self.model_hidden_size, dtype=self.dtype) * embed_std
@@ -871,11 +897,10 @@ class CLIPVisionTower(nn.Module):
         image_sizes = []
         for image_file in image_files:
             image = self.load_image(image_file)
-            image_size = torch.tensor(image.size).to(device='cuda', non_blocking=True)
+            # print(f'image_size {image.size}')
             out.append(image)
-            image_sizes.append(image_size)
+            image_sizes.append(image.size)
 
-        image_sizes = torch.stack(image_sizes, dim=0)
         return out, image_sizes
 
     def encode_images(self, image_files):
@@ -885,6 +910,7 @@ class CLIPVisionTower(nn.Module):
         if _debug: print(f'image_sizes', image_sizes)
 
         images_tensor = self.process_images(images).to(self.device, dtype=torch.float16)
+
         if _debug: print(f'process_images', images_tensor.shape)
 
         if type(images_tensor) is list or images_tensor.ndim == 5:
@@ -895,10 +921,10 @@ class CLIPVisionTower(nn.Module):
             print(f'after cat', concat_images_tensor.shape)
 
             image_features = self(concat_images_tensor)
-            if True: print(f'after vit', image_features.shape)
+            if _debug: print(f'after vit', image_features.shape)
 
             image_features = self.mm_projector(image_features)
-            if True: print(f'after project', image_features.shape)
+            if _debug: print(f'after projecter', image_features.shape)
 
             split_sizes = [image.shape[0] for image in images_tensor]
             image_features = torch.split(image_features, split_sizes, dim=0)
@@ -907,10 +933,10 @@ class CLIPVisionTower(nn.Module):
                 image_features = [x.flatten(0, 1) for x in image_features]
             elif self.mm_patch_merge_type.startswith('spatial'):
                 new_image_features = []
-                print(f'---> image_features ', image_features)
+                # print(f'---> image_features ', image_features)
 
                 for image_idx, image_feature in enumerate(image_features):
-                    print(f'image image_feature shape', image_feature.shape)
+                    if _debug: print(f'image image_feature shape', image_feature.shape)
                     if image_feature.shape[0] > 1:
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
@@ -1169,6 +1195,7 @@ def input_id_postprocess(start_ids, pad_id):
             for seq in start_ids
         ]
     )
+    # print(f'ids, {start_ids}, {start_lengths}, pad_id: {pad_id}')
     return start_ids, start_lengths
 
 def create_request_noimg(tk: Tokenizer, query, pad_id):
@@ -1273,7 +1300,7 @@ def create_request_feat(tk: Tokenizer,  query, features, featsize, pad_id, hidde
 if __name__ == "__main__":
     _debug = True
     dgtrt.enable_request_storage()
-    llava='/home/hxu/engine/model'
+    llava='/home/hxu/engine-yi-34b-6x-2560/model'
     device=torch.device('cuda:0')
     cpu = torch.device('cpu')
     tk = Tokenizer(llava)
