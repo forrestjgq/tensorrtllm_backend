@@ -19,6 +19,9 @@ from enum import auto, Enum
 from typing import List, Tuple
 import dgtrt
 import numpy as np
+import math
+import ast
+# from pynvml import *
 
 _debug = False
 
@@ -35,6 +38,15 @@ DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 IMAGE_PLACEHOLDER = "<image-placeholder>"
+
+
+# def mem_usage(str:str): 
+#     h = nvmlDeviceGetHandleByIndex(0)
+#     info = nvmlDeviceGetMemoryInfo(h)
+#     print(f'{str}')
+#     print(f'total    : {info.total/1024**2:.2f}')
+#     print(f'free     : {info.free / 1024**2:.2f}')
+#     print(f'used     : {info.used / 1024**2:.2f}')`
 
 def split_list(lst, value):
     sublists = []
@@ -59,6 +71,141 @@ class IdentityMap(nn.Module):
     def config(self):
         return {"mm_projector_type": 'identity'}
 
+def select_best_resolution(original_size, possible_resolutions):
+    """
+    Selects the best resolution from a list of possible resolutions based on the original size.
+
+    Args:
+        original_size (tuple): The original size of the image in the format (width, height).
+        possible_resolutions (list): A list of possible resolutions in the format [(width1, height1), (width2, height2), ...].
+
+    Returns:
+        tuple: The best fit resolution in the format (width, height).
+    """
+    original_width, original_height = original_size
+    best_fit = None
+    max_effective_resolution = 0
+    min_wasted_resolution = float('inf')
+
+    for width, height in possible_resolutions:
+        scale = min(width / original_width, height / original_height)
+        downscaled_width, downscaled_height = int(original_width * scale), int(original_height * scale)
+        effective_resolution = min(downscaled_width * downscaled_height, original_width * original_height)
+        wasted_resolution = (width * height) - effective_resolution
+
+        if effective_resolution > max_effective_resolution or (effective_resolution == max_effective_resolution and wasted_resolution < min_wasted_resolution):
+            max_effective_resolution = effective_resolution
+            min_wasted_resolution = wasted_resolution
+            best_fit = (width, height)
+
+    return best_fit
+
+
+def resize_and_pad_image(image, target_resolution):
+    """
+    Resize and pad an image to a target resolution while maintaining aspect ratio.
+
+    Args:
+        image (PIL.Image.Image): The input image.
+        target_resolution (tuple): The target resolution (width, height) of the image.
+
+    Returns:
+        PIL.Image.Image: The resized and padded image.
+    """
+    original_width, original_height = image.size
+    target_width, target_height = target_resolution
+
+    scale_w = target_width / original_width
+    scale_h = target_height / original_height
+
+    if scale_w < scale_h:
+        new_width = target_width
+        new_height = min(math.ceil(original_height * scale_w), target_height)
+    else:
+        new_height = target_height
+        new_width = min(math.ceil(original_width * scale_h), target_width)
+
+    # Resize the image
+    resized_image = image.resize((new_width, new_height))
+
+    new_image = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+    paste_x = (target_width - new_width) // 2
+    paste_y = (target_height - new_height) // 2
+    new_image.paste(resized_image, (paste_x, paste_y))
+
+    return new_image
+
+
+def divide_to_patches(image, patch_size):
+    """
+    Divides an image into patches of a specified size.
+
+    Args:
+        image (PIL.Image.Image): The input image.
+        patch_size (int): The size of each patch.
+
+    Returns:
+        list: A list of PIL.Image.Image objects representing the patches.
+    """
+    patches = []
+    width, height = image.size
+    for i in range(0, height, patch_size):
+        for j in range(0, width, patch_size):
+            box = (j, i, j + patch_size, i + patch_size)
+            patch = image.crop(box)
+            patches.append(patch)
+
+    return patches
+
+
+def unpad_image(tensor, original_size):
+    """
+    Unpads a PyTorch tensor of a padded and resized image.
+
+    Args:
+    tensor (torch.Tensor): The image tensor, assumed to be in CxHxW format.
+    original_size (tuple): The original size of the image (height, width).
+
+    Returns:
+    torch.Tensor: The unpadded image tensor.
+    """
+    original_width, original_height = original_size
+    current_height, current_width = tensor.shape[1:]
+
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
+
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(original_height * scale_factor)
+        padding = (current_height - new_height) // 2
+        unpadded_tensor = tensor[:, padding:current_height - padding, :]
+    else:
+        scale_factor = current_height / original_height
+        new_width = int(original_width * scale_factor)
+        padding = (current_width - new_width) // 2
+        unpadded_tensor = tensor[:, :, padding:current_width - padding]
+
+    return unpadded_tensor
+
+def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
+    """
+    Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
+
+    Args:
+        image_size (tuple): The size of the input image in the format (width, height).
+        grid_pinpoints (str): A string representation of a list of possible resolutions.
+        patch_size (int): The size of each image patch.
+
+    Returns:
+        tuple: The shape of the image patch grid in the format (width, height).
+    """
+    if type(grid_pinpoints) is list:
+        possible_resolutions = grid_pinpoints
+    else:
+        possible_resolutions = ast.literal_eval(grid_pinpoints)
+    width, height = select_best_resolution(image_size, possible_resolutions)
+    return width // patch_size, height // patch_size
 
 class SimpleResBlock(nn.Module):
     def __init__(self, channels):
@@ -451,6 +598,17 @@ conv_llava_v1_mmtag = Conversation(
     version="v1_mmtag",
 )
 
+conv_chatml_direct = Conversation(
+    system="""<|im_start|>system
+    Answer the questions.""",
+    roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
+    version="mpt",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.MPT,
+    sep="<|im_end|>",
+)
+
 default_conversation = conv_vicuna_v1
 conv_templates = {
     "default": conv_vicuna_v0,
@@ -467,6 +625,7 @@ conv_templates = {
     "v1_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
 
+    "chatml_direct": conv_chatml_direct,
     "mpt": conv_mpt,
 }
 
@@ -487,9 +646,16 @@ class Tokenizer:
             self.tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
 
         # todo: use model name to decide conversation mode
-        self.conv_mode = "llava_v1"
+        modeName = self.llava_config["_name_or_path"]
+        print(f'llava model: {modeName}')
+        if "yi" in modeName.lower():
+            self.conv_mode = "chatml_direct"
+        else:
+            self.conv_mode = "llava_v1"
+        print(f'conv_mode: {self.conv_mode}')
         self.image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
         self.conv = conv_templates[self.conv_mode]
+        # nvmlInit() import pynvml
 
     def tokenizer_image_token(self, prompt, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
         prompt_chunks = [self.tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
@@ -597,12 +763,20 @@ class CLIPVisionTower(nn.Module):
             vision_tower_path = str(pathlib.Path(llava_model_path) /'vision_tower')
         self.select_layer = self.llava_config["mm_vision_select_layer"]
         self.select_feature = self.llava_config.get('mm_vision_select_feature', 'patch')
-
+        self.image_grid_pinpoints = self.llava_config["image_grid_pinpoints"]
+        self.mm_patch_merge_type = self.llava_config.get('mm_patch_merge_type', 'flat')
+        self.image_aspect_ratio = self.llava_config.get('image_aspect_ratio', 'square')
+        self.model_hidden_size = self.llava_config["hidden_size"]
         self.image_processor = CLIPImageProcessor.from_pretrained(vision_tower_path)
         self.vision_tower = CLIPVisionModel.from_pretrained(vision_tower_path)
 
         self.mm_projector = build_vision_projector(self.llava_config)
 
+        if 'unpad' in self.mm_patch_merge_type:
+            embed_std = 1 / torch.sqrt(torch.tensor(self.model_hidden_size, dtype=self.dtype))
+            self.image_newline = nn.Parameter(
+                torch.randn(self.model_hidden_size, dtype=self.dtype) * embed_std
+            )
         if mm_weight_path is None:
             # mm projector weight is extracted from llava weights and 
             # saved in engine-dir/model/mm_projector.bin in model building
@@ -636,6 +810,38 @@ class CLIPVisionTower(nn.Module):
     def load_image_from_base64(self, image):
         return Image.open(BytesIO(base64.b64decode(image)))
 
+
+
+    def process_anyres_image(self, image, processor, grid_pinpoints):
+        """
+        Process an image with variable resolutions.
+
+        Args:
+            image (PIL.Image.Image): The input image to be processed.
+            processor: The image processor object.
+            grid_pinpoints (str): A string representation of a list of possible resolutions.
+
+        Returns:
+            torch.Tensor: A tensor containing the processed image patches.
+        """
+        if type(grid_pinpoints) is list:
+            possible_resolutions = grid_pinpoints
+        else:
+            possible_resolutions = ast.literal_eval(grid_pinpoints)
+        best_resolution = select_best_resolution(image.size, possible_resolutions)
+        image_padded = resize_and_pad_image(image, best_resolution)
+
+        patches = divide_to_patches(image_padded, processor.crop_size['height'])
+        if _debug: print(f'patches size', len(patches))
+
+        image_original_resize = image.resize((processor.size['shortest_edge'], processor.size['shortest_edge']))
+
+        image_patches = [image_original_resize] + patches
+        if _debug: print(f'image_patches size', len(image_patches))
+        image_patches = [processor.preprocess(image_patch, return_tensors='pt')['pixel_values'][0]
+                        for image_patch in image_patches]
+        return torch.stack(image_patches, dim=0)
+
     def expand2square(self, pil_img, background_color):
         width, height = pil_img.size
         if width == height:
@@ -648,6 +854,7 @@ class CLIPVisionTower(nn.Module):
             result = Image.new(pil_img.mode, (height, height), background_color)
             result.paste(pil_img, ((height - width) // 2, 0))
             return result
+
     def process_images(self, images):
         image_aspect_ratio = self.llava_config.get("image_aspect_ratio", None)
         new_images = []
@@ -657,8 +864,13 @@ class CLIPVisionTower(nn.Module):
                 image = self.expand2square(image, bgcolor)
                 image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                 new_images.append(image)
+        elif image_aspect_ratio == "anyres":
+            for image in images:
+                image = self.process_anyres_image(image, self.image_processor, self.image_grid_pinpoints)
+                new_images.append(image)
         else:
             return self.image_processor(images, return_tensors='pt')['pixel_values']
+
         if all(x.shape == new_images[0].shape for x in new_images):
             new_images = torch.stack(new_images, dim=0)
         return new_images
@@ -682,18 +894,95 @@ class CLIPVisionTower(nn.Module):
 
     def load_images(self, image_files):
         out = []
+        image_sizes = []
         for image_file in image_files:
             image = self.load_image(image_file)
+            # print(f'image_size {image.size}')
             out.append(image)
-        return out
+            image_sizes.append(image.size)
+
+        return out, image_sizes
 
     def encode_images(self, image_files):
         if isinstance(image_files, str):
             image_files = [image_files]
-        images = self.load_images(image_files)
+        images, image_sizes = self.load_images(image_files)
+        if _debug: print(f'image_sizes', image_sizes)
+
         images_tensor = self.process_images(images).to(self.device, dtype=torch.float16)
-        image_features = self(images_tensor)
-        image_features = self.mm_projector(image_features)
+
+        if _debug: print(f'process_images', images_tensor.shape)
+
+        if type(images_tensor) is list or images_tensor.ndim == 5:
+            if type(images_tensor) is list:
+                images_tensor = [x.unsqueeze(0) if x.ndim == 3 else x for x in images_tensor]
+
+            concat_images_tensor = torch.cat([image_tensor for image_tensor in images_tensor], dim=0)
+            print(f'after cat', concat_images_tensor.shape)
+
+            image_features = self(concat_images_tensor)
+            if _debug: print(f'after vit', image_features.shape)
+
+            image_features = self.mm_projector(image_features)
+            if _debug: print(f'after projecter', image_features.shape)
+
+            split_sizes = [image.shape[0] for image in images_tensor]
+            image_features = torch.split(image_features, split_sizes, dim=0)
+
+            if self.mm_patch_merge_type == 'flat':
+                image_features = [x.flatten(0, 1) for x in image_features]
+            elif self.mm_patch_merge_type.startswith('spatial'):
+                new_image_features = []
+                # print(f'---> image_features ', image_features)
+
+                for image_idx, image_feature in enumerate(image_features):
+                    if _debug: print(f'image image_feature shape', image_feature.shape)
+                    if image_feature.shape[0] > 1:
+                        base_image_feature = image_feature[0]
+                        image_feature = image_feature[1:]
+                        height = width = self.num_patches_per_side
+                        assert height * width == base_image_feature.shape[0]
+                        if self.image_aspect_ratio == 'anyres':
+                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.image_grid_pinpoints, self.config.image_size)
+                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+
+                        else:
+                            raise NotImplementedError
+                        if 'unpad' in self.mm_patch_merge_type:
+                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                            image_feature = torch.cat((
+                                image_feature,
+                                self.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
+                            ), dim=-1)
+                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+
+                        else:
+                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                            image_feature = image_feature.flatten(0, 3)
+                        image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+
+                    else:
+                        image_feature = image_feature[0]
+                        if 'unpad' in self.mm_patch_merge_type:
+                            image_feature = torch.cat((
+                                image_feature,
+                                self.image_newline[None].to(image_feature.device)
+                            ), dim=0)
+                    # print(f'appended image_feature shape', image_feature.shape)
+                    # print(f'appended image_feature ', image_feature)
+                    new_image_features.append(image_feature)
+
+                image_features = torch.stack(new_image_features, dim=0)
+
+            else:
+                raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
+        else:
+            image_features = self(images_tensor)
+            image_features = self.mm_projector(image_features)
+            image_features = image_features
+
         return image_features
 
     def feature_select(self, image_forward_outs):
@@ -739,6 +1028,10 @@ class CLIPVisionTower(nn.Module):
     @property
     def hidden_size(self):
         return self.config.hidden_size
+
+    @property
+    def num_patches_per_side(self):
+        return self.config.image_size // self.config.patch_size
 
     @property
     def num_patches(self):
@@ -884,41 +1177,6 @@ def decode_image(vt: CLIPVisionTower, images, store = False):
         return indices
     return feats
 
-def create_request1(tk: Tokenizer, vt, query, images, pad_id):
-    """
-    query : batch string (2D numpy array)
-    """
-    if _debug: print(f"query: {query}")  # like [[b'hello']]
-    if _debug: print(f"images: {images}")  # like [[b'hello']]
-    if _debug:
-        if hasattr(query, "shape") and hasattr(images, "shape"):
-            print(f"shape of query {query.shape} images {images.shape}")
-    # images [batch, [image list]] -> [[image1, image2, ...], [...]]
-    images = [[s.decode() for s in batch] for batch in images]
-    start_ids = [
-        np.array(tk.encode(s[0].decode(), decode_image(vt, img, store=True), stored=True)).astype(int)
-        for s, img in zip(query, images)
-    ]
-    # start_ids = [s[:10] for s in start_ids]
-    if _debug: print(f"start ids {start_ids} @ {os.getpid()}")
-    start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
-
-    max_len = 0
-    for seq in start_ids:
-        max_len = max(max_len, seq.shape[0])
-    start_ids = np.stack(
-        [
-            np.pad(
-                seq,
-                (0, max_len - seq.shape[0]),
-                "constant",
-                constant_values=(0, pad_id),
-            )
-            for seq in start_ids
-        ]
-    )
-
-    return start_ids, start_lengths
 def input_id_postprocess(start_ids, pad_id):
     if _debug: print(f"start ids {start_ids} @ {os.getpid()}")
     start_lengths = np.array([[len(ids)] for ids in start_ids]).astype(int)
@@ -937,7 +1195,7 @@ def input_id_postprocess(start_ids, pad_id):
             for seq in start_ids
         ]
     )
-
+    # print(f'ids, {start_ids}, {start_lengths}, pad_id: {pad_id}')
     return start_ids, start_lengths
 
 def create_request_noimg(tk: Tokenizer, query, pad_id):
@@ -959,6 +1217,7 @@ def create_request_vision_tower(tk: Tokenizer, vt, query, images, pad_id):
     # images [batch, [image list]] -> [[image1, image2, ...], [...]]
     images = [[s.decode() for s in batch] for batch in images]
     feats = [decode_image(vt,img) for img in images] # [batch, np.array(nimage, 576, 4096)]
+    if _debug: print(f'decoded feats: {feats}')
     if _debug: print(f'feats len {len(feats)} shape {feats[0].shape}')
     start_ids = [
         np.array(tk.encode_with_delay_feature(s[0].decode(), feat.shape[0], feat.shape[1])).astype(int)
@@ -1041,8 +1300,8 @@ def create_request_feat(tk: Tokenizer,  query, features, featsize, pad_id, hidde
 if __name__ == "__main__":
     _debug = True
     dgtrt.enable_request_storage()
-    llava='/data/jgq/tmpfs/llava-v1.5-13b-engine1/model'
-    device=torch.device('cuda:4')
+    llava='/home/hxu/engine-yi-34b-6x-2560/model'
+    device=torch.device('cuda:0')
     cpu = torch.device('cpu')
     tk = Tokenizer(llava)
     
@@ -1050,8 +1309,8 @@ if __name__ == "__main__":
         tk.tokenizer.pad_token, add_special_tokens=False
     )[0]
     vt = CLIPVisionTower(llava, device)
-    prompt = [[b"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER:What did you see in this image? and how are you feeling?<image-placeholder><image-placeholder> ASSISTANT:"]]
-    image_file = [[b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg", b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg"]]
+    prompt = [[b"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER:What did you see in this image? and how are you feeling?<image> ASSISTANT:"]]
+    image_file = [[b"https://a.zdmimg.com/202311/24/65606515c70142420.jpg_fo742.jpg"]]
     ids, lens, feats = create_request_vision_tower(tk,  vt, prompt, image_file, pad_id)
     print('ids ', ids)
     print('lens ', lens)
